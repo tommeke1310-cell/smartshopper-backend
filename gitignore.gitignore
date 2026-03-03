@@ -1,0 +1,18 @@
+## Visual Studio opschonen
+[Bb]in/
+[Ob]j/
+out/
+.vs/
+.vscode/
+
+## Gebruikersspecifieke bestanden
+*.user
+*.userosscache
+*.sln.doccache
+
+## OS bestanden
+.DS_Store
+Thumbs.db
+
+## ASP.NET Core
+appsettings.Development.json
