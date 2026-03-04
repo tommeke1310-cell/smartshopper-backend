@@ -1,30 +1,51 @@
 using System.Text.Json;
 using System.Net.Http.Json;
 using SmartShopper.API.Models;
+using SmartShopper.API.Services.Scrapers;
 using System.Globalization;
+using System.Collections.Concurrent;
 
 namespace SmartShopper.API.Services;
 
 public class CompareService
 {
-    private readonly HttpClient _http;
-    private readonly IConfiguration _config;
+    private readonly HttpClient              _http;
+    private readonly IConfiguration         _config;
     private readonly ILogger<CompareService> _logger;
+    private readonly AlbertHeijnScraper      _ahScraper;
+    private readonly JumboScraper            _jumboScraper;
+    private readonly LidlScraper             _lidlScraper;
+    private readonly AldiScraper             _aldiScraper;
+    private readonly ReweScraper             _reweScraper;
+    private readonly EdekaScraper            _edekaScraper;
+
     private readonly string _supabaseUrl;
     private readonly string _supabaseKey;
 
+    // In-memory prijscache: slaat ProductMatch op (inclusief bio/vegan/merk flags)
+    private static readonly ConcurrentDictionary<string, (List<ProductMatch> matches, DateTime cachedAt)> _cache = new();
+    private static readonly TimeSpan CACHE_TTL = TimeSpan.FromHours(2);
 
-    public CompareService(HttpClient http, IConfiguration config, ILogger<CompareService> logger)
+    public CompareService(
+        HttpClient http, IConfiguration config, ILogger<CompareService> logger,
+        AlbertHeijnScraper ah, JumboScraper jumbo, LidlScraper lidl,
+        AldiScraper aldi, ReweScraper rewe, EdekaScraper edeka)
     {
-        _http = http;
-        _config = config;
-        _logger = logger;
-        _supabaseUrl = config["Supabase:Url"] ?? "";
+        _http         = http;
+        _config       = config;
+        _logger       = logger;
+        _ahScraper    = ah;
+        _jumboScraper = jumbo;
+        _lidlScraper  = lidl;
+        _aldiScraper  = aldi;
+        _reweScraper  = rewe;
+        _edekaScraper = edeka;
+
+        _supabaseUrl = config["Supabase:Url"]     ?? "";
         _supabaseKey = config["Supabase:AnonKey"] ?? "";
 
-        _http.DefaultRequestHeaders.Clear();
-        _http.DefaultRequestHeaders.Add("User-Agent", "SmartShopper-API/1.0");
-        _http.DefaultRequestHeaders.Add("Accept", "application/json");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "SmartShopper-API/1.0");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
     }
 
     public async Task<CompareResult> ComparePricesAsync(CompareRequest request)
@@ -33,8 +54,7 @@ public class CompareService
 
         var nearbyStores = await GetNearbyStoresFromGoogle(
             request.UserLatitude, request.UserLongitude,
-            request.MaxDistanceKm, request.IncludeBelgium, request.IncludeGermany
-        );
+            request.MaxDistanceKm, request.IncludeBelgium, request.IncludeGermany);
 
         if (!nearbyStores.Any())
         {
@@ -43,374 +63,453 @@ public class CompareService
         }
 
         _logger.LogInformation("Gevonden winkels: {Stores}",
-            string.Join(", ", nearbyStores.Select(s => $"{s.Chain} ({s.Country})")));
+            string.Join(", ", nearbyStores.Select(s => $"{s.Chain} {s.City} ({s.Country})")));
+
+        // Preferred stores bovenaan zetten
+        if (request.PreferredStores.Any())
+            nearbyStores = nearbyStores
+                .OrderBy(s => request.PreferredStores.Contains(s.Chain) ? 0 : 1)
+                .ThenBy(s => s.DistanceKm)
+                .ToList();
 
         var comparisonTasks = nearbyStores.Select(async store =>
         {
             var comparison = new StoreComparison { Store = store };
-            decimal groceryTotal = 0;
+            decimal groceryTotal      = 0;
+            int     preferenceMatches = 0;
 
             foreach (var item in request.Items)
             {
-                var priceResult = await GetPriceFromDatabase(item.Name, store.Chain, store.Country);
-                comparison.Products.Add(priceResult);
-                if (priceResult.Success)
-                    groceryTotal += priceResult.Price * item.Quantity;
+                // Haal ProductMatch(es) op — met bio/vegan/merk flags
+                var matches = await GetMatchesWithFallbackChain(item, store.Chain, store.Country);
+                var best    = SelectBestMatch(matches, item, request.Preferences);
+
+                // Zet om naar ScraperResult voor backward compatibility
+                var scraperResult = new ScraperResult(best.ProductName, best.Price, best.Price > 0)
+                {
+                    IsPromo     = best.IsPromo,
+                    IsEstimated = best.IsEstimated,
+                };
+                comparison.Products.Add(scraperResult);
+
+                if (scraperResult.Success)
+                {
+                    groceryTotal += scraperResult.Price * item.Quantity;
+
+                    // Tel hoeveel producten de voorkeur matchen
+                    if (request.Preferences != null && MatchesPreferences(best, request.Preferences))
+                        preferenceMatches++;
+                }
             }
 
-            comparison.GroceryTotal = groceryTotal;
-            comparison.FuelCostEur = CalculateFuelCosts(store.DistanceKm, request.FuelConsumptionLPer100Km, store.Country);
-            comparison.TotalCost = comparison.GroceryTotal + comparison.FuelCostEur;
+            comparison.GroceryTotal         = groceryTotal;
+            comparison.FuelCostEur          = CalculateFuelCosts(store.DistanceKm, request.FuelConsumptionLPer100Km, store.Country, request);
+            comparison.TotalCost            = groceryTotal + comparison.FuelCostEur;
+            comparison.PreferenceMatchCount = preferenceMatches;
+            comparison.PreferenceTotalCount = request.Items.Count;
             return comparison;
         });
 
-        var allComparisons = await Task.WhenAll(comparisonTasks);
+        var allComparisons  = await Task.WhenAll(comparisonTasks);
+        var validComparisons = allComparisons.Where(c => c.GroceryTotal > 0).ToList();
+        if (!validComparisons.Any()) return result;
 
-        // Referentie = duurste optie (zodat spaarbedragen altijd logisch zijn)
-        decimal referenceTotal = allComparisons
-            .Where(c => c.GroceryTotal > 0)
-            .Max(c => c.TotalCost);
+        decimal referenceTotal = validComparisons.Max(c => c.TotalCost);
 
-        result.Stores = allComparisons
-            .Where(c => c.GroceryTotal > 0)
-            .OrderBy(c => c.TotalCost)
-            .ToList();
+        // Sortering: als PrijsPrioriteit = "voorkeur-matching", gebruik preferences score
+        result.Stores = request.Preferences?.PrijsPrioriteit == "voorkeur-matching"
+            ? validComparisons
+                .OrderByDescending(c => c.PreferenceMatchCount)
+                .ThenBy(c => c.TotalCost)
+                .ToList()
+            : validComparisons
+                .OrderBy(c => c.TotalCost)
+                .ToList();
 
         foreach (var store in result.Stores)
             store.SavingsVsReference = Math.Max(0, referenceTotal - store.TotalCost);
 
-        if (result.Stores.Any())
+        result.Stores.First().IsBestDeal = true;
+        result.BestDeal   = result.Stores.First();
+        result.MaxSavings = result.Stores.First().SavingsVsReference;
+
+        // Budget waarschuwing
+        if (request.Preferences?.Weekbudget.HasValue == true && request.Preferences.BudgetWaarschuwing)
         {
-            result.Stores.First().IsBestDeal = true;
-            result.BestDeal = result.Stores.First();
-            result.MaxSavings = result.Stores.First().SavingsVsReference;
+            var budget = request.Preferences.Weekbudget.Value;
+            var best   = result.BestDeal.TotalCost;
+            if (best > budget)
+                result.Budget = new BudgetWarning
+                {
+                    OverWeekBudget = true,
+                    WeekBudget     = budget,
+                    BestDealTotal  = best,
+                    Overshoot      = Math.Round(best - budget, 2)
+                };
         }
+
+        // Fire-and-forget: sla prijzen op in Supabase
+        foreach (var store in result.Stores.Take(5))
+            foreach (var (product, item) in store.Products.Zip(request.Items))
+                if (product.Success)
+                    _ = Task.Run(() => SavePriceToSupabase(item.Name, product.ProductName, store.Store.Chain, store.Store.Country, product.Price));
 
         return result;
     }
 
-    // ─── SUPABASE PRIJSOPZOEKING ──────────────────────────────────
+    // ─── PREFERENCES FILTERING ───────────────────────────────────
 
-    private async Task<ScraperResult> GetPriceFromDatabase(string productQuery, string store, string country)
+    /// <summary>
+    /// Kies de beste ProductMatch gegeven de gebruikersvoorkeuren.
+    /// Als geen enkele match voldoet, pak de eerste (goedkoopste).
+    /// </summary>
+    private static ProductMatch SelectBestMatch(List<ProductMatch> matches, GroceryItem item, UserPreferences? prefs)
+    {
+        if (!matches.Any())
+            return new ProductMatch { ProductName = item.Name, Price = 0, IsEstimated = true };
+
+        if (prefs == null) return matches.First();
+
+        // Sorteer op: voorkeur-score (hoog = beter) dan prijs (laag = beter)
+        var ranked = matches
+            .OrderByDescending(m => PreferenceScore(m, item, prefs))
+            .ThenBy(m => m.Price)
+            .ToList();
+
+        return ranked.First();
+    }
+
+    private static int PreferenceScore(ProductMatch m, GroceryItem item, UserPreferences prefs)
+    {
+        int score = 0;
+
+        if (prefs.IsVegan       && m.IsVegan)         score += 10;
+        if (prefs.VoorkeurBiologisch && m.IsBiologisch) score += 8;
+
+        // Merkvoorkeur: pak de categorie van het product (op basis van naam)
+        var category = GuessCategory(item.Name);
+        if (prefs.Merkvoorkeur.TryGetValue(category, out var voorkeur))
+        {
+            if (voorkeur == "a-merk"    && m.IsAMerk)    score += 6;
+            if (voorkeur == "huismerk"  && m.IsHuisMerk) score += 6;
+            if (voorkeur == "maakt-niet-uit")             score += 3; // neutraal bonus
+        }
+
+        // Favoriete winkels
+        if (prefs.FavorieteWinkels.Contains(m.StoreName)) score += 4;
+
+        return score;
+    }
+
+    private static bool MatchesPreferences(ProductMatch m, UserPreferences prefs)
+    {
+        if (prefs.IsVegan         && !m.IsVegan)         return false;
+        if (prefs.VoorkeurBiologisch && !m.IsBiologisch) return false;
+        return true;
+    }
+
+    /// <summary>Geeft de categorie naam terug die overeenkomt met de merkvoorkeur-sleutels in AuthScreens.tsx</summary>
+    private static string GuessCategory(string productName)
+    {
+        var n = productName.ToLower();
+        if (n.Contains("cola") || n.Contains("fanta") || n.Contains("soda") || n.Contains("frisdrank") || n.Contains("sap")) return "frisdrank";
+        if (n.Contains("wasmiddel") || n.Contains("waspoeder") || n.Contains("ariel") || n.Contains("persil")) return "wasmiddel";
+        if (n.Contains("melk") || n.Contains("yoghurt") || n.Contains("kaas") || n.Contains("boter") || n.Contains("zuivel")) return "zuivel";
+        if (n.Contains("brood") || n.Contains("boterham") || n.Contains("toast")) return "brood";
+        if (n.Contains("vlees") || n.Contains("gehakt") || n.Contains("kipfilet") || n.Contains("worst")) return "vlees";
+        if (n.Contains("chips") || n.Contains("snack") || n.Contains("koek") || n.Contains("nootjes")) return "snacks";
+        if (n.Contains("koffie") || n.Contains("espresso") || n.Contains("cappuccino")) return "koffie";
+        if (n.Contains("schoonmaak") || n.Contains("reiniger") || n.Contains("bleek")) return "schoonmaak";
+        return "overig";
+    }
+
+    // ─── SCRAPER FALLBACK KETEN ──────────────────────────────────
+
+    private async Task<List<ProductMatch>> GetMatchesWithFallbackChain(GroceryItem item, string store, string country)
+    {
+        string cacheKey = $"{item.Name.ToLower()}|{store}|{country}";
+
+        if (_cache.TryGetValue(cacheKey, out var cached) && DateTime.UtcNow - cached.cachedAt < CACHE_TTL)
+        {
+            _logger.LogDebug("Cache hit: {Key}", cacheKey);
+            return cached.matches;
+        }
+
+        List<ProductMatch> matches = store switch
+        {
+            "Albert Heijn" => await _ahScraper.SearchProductAsync(item),
+            "Jumbo"        => await _jumboScraper.SearchProductAsync(item),
+            "Lidl"         => await _lidlScraper.SearchProductAsync(item, country),
+            "Aldi"         => await _aldiScraper.SearchProductAsync(item, "NL"),
+            "Aldi Süd"     => await _aldiScraper.SearchProductAsync(item, "DE"),
+            "Rewe"         => await _reweScraper.SearchProductAsync(item),
+            "Edeka"        => await _edekaScraper.SearchProductAsync(item),
+            _              => []
+        };
+
+        // Fallback: Open Food Facts + schatting
+        if (!matches.Any() || matches.All(m => m.Price <= 0))
+        {
+            var estimated = await EstimateViaOFF(item, store, country);
+            matches = [estimated];
+        }
+
+        if (matches.Any(m => m.Price > 0))
+            _cache[cacheKey] = (matches, DateTime.UtcNow);
+
+        return matches;
+    }
+
+    private async Task<ProductMatch> EstimateViaOFF(GroceryItem item, string store, string country)
     {
         try
         {
-            var url = $"{_supabaseUrl}/rest/v1/rpc/search_product_price";
-            using var request = new HttpRequestMessage(HttpMethod.Post, url);
-            request.Headers.Add("apikey", _supabaseKey);
-            request.Headers.Add("Authorization", $"Bearer {_supabaseKey}");
-            request.Content = JsonContent.Create(new
-            {
-                search_query = productQuery,
-                store_name   = store,
-                country_code = country
-            });
+            string lang = country == "DE" ? "de" : "nl";
+            var url = $"https://world.openfoodfacts.org/cgi/search.pl" +
+                      $"?search_terms={Uri.EscapeDataString(item.Name)}&search_simple=1" +
+                      $"&action=process&json=1&page_size=3&lc={lang}&cc={country.ToLower()}";
 
-            var response = await _http.SendAsync(request);
-            if (!response.IsSuccessStatusCode)
-                return await ScrapeLiveFallback(productQuery, store, country);
-
-            var json = await response.Content.ReadAsStringAsync();
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
+            client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "SmartShopper/1.0");
+            var json = await client.GetStringAsync(url);
             using var doc = JsonDocument.Parse(json);
 
-            if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
+            if (doc.RootElement.TryGetProperty("products", out var products))
             {
-                var first = doc.RootElement[0];
-                decimal price = first.GetProperty("price").GetDecimal();
-                string name   = first.TryGetProperty("product_name", out var n) ? n.GetString() ?? productQuery : productQuery;
-                bool isPromo  = first.TryGetProperty("is_promo", out var p) && p.GetBoolean();
-
-                _logger.LogInformation("DB: {Product} @ {Store} {Country} = €{Price}", name, store, country, price);
-                return new ScraperResult(name, price, true) { IsPromo = isPromo };
-            }
-
-            // Niet in database → live scrapen
-            return await ScrapeLiveFallback(productQuery, store, country);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "DB fout voor {Product} @ {Store}", productQuery, store);
-            return new ScraperResult(productQuery, 0, false);
-        }
-    }
-
-    // ─── LIVE SCRAPING FALLBACK ───────────────────────────────────
-
-    private async Task<ScraperResult> ScrapeLiveFallback(string query, string store, string country)
-    {
-        _logger.LogInformation("Live fallback: {Product} @ {Store} {Country}", query, store, country);
-        try
-        {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
-            client.DefaultRequestHeaders.Add("User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
-
-            var result = store switch
-            {
-                "Albert Heijn" => await ScrapeAH(client, query),
-                "Jumbo"        => await ScrapeJumbo(client, query),
-                _              => new ScraperResult(query, 0, false)
-            };
-
-            // Als live scrape succesvol is, sla op in database
-            if (result.Success)
-                _ = Task.Run(() => SavePriceToDatabase(query, result.ProductName, store, country, result.Price));
-
-            return result;
-        }
-        catch { return new ScraperResult(query, 0, false); }
-    }
-
-    private async Task<ScraperResult> ScrapeAH(HttpClient client, string query)
-    {
-        try
-        {
-            var url = $"https://www.ah.nl/zoeken/api/v1/search?query={Uri.EscapeDataString(query)}&page=0&size=3";
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.Add("Referer", "https://www.ah.nl/");
-            req.Headers.Add("x-application", "ah-storelocator");
-
-            var resp = await client.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
-
-            var data = await resp.Content.ReadFromJsonAsync<JsonElement>();
-            if (!data.TryGetProperty("cards", out var cards)) return new ScraperResult(query, 0, false);
-
-            foreach (var card in cards.EnumerateArray())
-            {
-                if (!card.TryGetProperty("products", out var products)) continue;
-                foreach (var product in products.EnumerateArray())
+                foreach (var p in products.EnumerateArray())
                 {
-                    if (!product.TryGetProperty("price", out var priceObj)) continue;
-                    decimal price = 0;
-                    if (priceObj.TryGetProperty("now", out var now)) price = now.GetDecimal();
-                    if (price <= 0) continue;
-                    string title = product.TryGetProperty("title", out var t) ? t.GetString() ?? query : query;
-                    return new ScraperResult(title, price, true);
+                    var name = p.TryGetProperty("product_name_nl", out var nl) ? nl.GetString() :
+                               p.TryGetProperty("product_name",    out var pn) ? pn.GetString() : null;
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    bool isBio   = name.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
+                                   (p.TryGetProperty("labels_tags", out var lt) &&
+                                    lt.EnumerateArray().Any(l => l.GetString()?.Contains("organic") == true));
+                    bool isVegan = p.TryGetProperty("labels_tags", out var lbt) &&
+                                   lbt.EnumerateArray().Any(l => l.GetString()?.Contains("vegan") == true);
+
+                    string category = p.TryGetProperty("categories_tags", out var cats)
+                        ? cats.EnumerateArray().FirstOrDefault().GetString() ?? "" : "";
+                    decimal price = EstimatePriceFromCategory(category, store, country);
+
+                    return new ProductMatch
+                    {
+                        StoreName       = store,
+                        Country         = country,
+                        ProductName     = name,
+                        Price           = price,
+                        IsEstimated     = true,
+                        IsBiologisch    = isBio,
+                        IsVegan         = isVegan,
+                        MatchConfidence = 0.5,
+                    };
                 }
             }
         }
-        catch (Exception ex) { _logger.LogWarning(ex, "AH live scrape fout"); }
-        return new ScraperResult(query, 0, false);
+        catch (Exception ex) { _logger.LogDebug(ex, "OFF fallback fout voor {Product}", item.Name); }
+
+        return new ProductMatch
+        {
+            StoreName   = store,
+            Country     = country,
+            ProductName = item.Name,
+            Price       = EstimatePriceFromCategory("", store, country),
+            IsEstimated = true,
+            MatchConfidence = 0.3,
+        };
     }
 
-    private async Task<ScraperResult> ScrapeJumbo(HttpClient client, string query)
+    private static decimal EstimatePriceFromCategory(string category, string store, string country)
     {
+        decimal basePrice = category.ToLower() switch
+        {
+            var c when c.Contains("beverages") || c.Contains("drink") || c.Contains("frisdrank") => 1.79m,
+            var c when c.Contains("dairy")     || c.Contains("zuivel") || c.Contains("milk")     => 1.29m,
+            var c when c.Contains("bread")     || c.Contains("brood")                             => 2.49m,
+            var c when c.Contains("meat")      || c.Contains("vlees")                             => 4.99m,
+            var c when c.Contains("snack")     || c.Contains("chips")                             => 2.19m,
+            var c when c.Contains("frozen")    || c.Contains("diepvries")                         => 3.49m,
+            var c when c.Contains("cleaning")  || c.Contains("schoonmaak")                        => 3.99m,
+            _ => 2.49m
+        };
+
+        decimal multiplier = (store, country) switch
+        {
+            ("Aldi", _) or ("Aldi Süd", _) => 0.82m,
+            ("Lidl", _)                    => 0.85m,
+            (_, "DE")                      => 0.88m,
+            (_, "BE")                      => 0.92m,
+            ("Albert Heijn", _)            => 1.10m,
+            _                              => 1.00m
+        };
+
+        return Math.Round(basePrice * multiplier, 2);
+    }
+
+    // ─── SUPABASE ─────────────────────────────────────────────────
+    private async Task SavePriceToSupabase(string searchQuery, string productName, string store, string country, decimal price)
+    {
+        if (string.IsNullOrEmpty(_supabaseUrl) || string.IsNullOrEmpty(_supabaseKey)) return;
         try
         {
-            var url = $"https://mobileapi.jumbo.com/v17/search?q={Uri.EscapeDataString(query)}&offset=0&limit=3";
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.Add("x-jumbo-client", "mobile-app");
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Add("apikey", _supabaseKey);
+            client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+            client.DefaultRequestHeaders.Add("Prefer", "return=representation");
 
-            var resp = await client.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
-
-            var data = await resp.Content.ReadFromJsonAsync<JsonElement>();
-            if (!data.TryGetProperty("products", out var pw) ||
-                !pw.TryGetProperty("data", out var products)) return new ScraperResult(query, 0, false);
-
-            foreach (var product in products.EnumerateArray())
-            {
-                decimal price = 0;
-                if (product.TryGetProperty("prices", out var prices))
+            var productResp = await client.PostAsJsonAsync(
+                $"{_supabaseUrl}/rest/v1/products?on_conflict=name", new
                 {
-                    if (prices.TryGetProperty("promotionalPrice", out var promo) &&
-                        promo.TryGetProperty("amount", out var pa))
-                        price = pa.GetDecimal() / 100m;
-                    else if (prices.TryGetProperty("price", out var p) &&
-                             p.TryGetProperty("amount", out var a))
-                        price = a.GetDecimal() / 100m;
-                }
-                if (price <= 0) continue;
-                string title = product.TryGetProperty("title", out var t) ? t.GetString() ?? query : query;
-                return new ScraperResult(title, price, true);
-            }
-        }
-        catch (Exception ex) { _logger.LogWarning(ex, "Jumbo live scrape fout"); }
-        return new ScraperResult(query, 0, false);
-    }
+                    name         = productName,
+                    search_query = searchQuery,
+                    updated_at   = DateTime.UtcNow,
+                });
 
-    // ─── PRIJS OPSLAAN IN DATABASE ────────────────────────────────
-
-    private async Task SavePriceToDatabase(string searchQuery, string productName, string store, string country, decimal price)
-    {
-        try
-        {
-            // Stap 1: Upsert product (op naam)
-            var productUrl = $"{_supabaseUrl}/rest/v1/products?on_conflict=name";
-            using var productReq = new HttpRequestMessage(HttpMethod.Post, productUrl);
-            productReq.Headers.Add("apikey", _supabaseKey);
-            productReq.Headers.Add("Authorization", $"Bearer {_supabaseKey}");
-            productReq.Headers.Add("Prefer", "return=representation,resolution=merge-duplicates");
-            productReq.Content = JsonContent.Create(new { name = productName, category = "Overig" });
-
-            var productResp = await _http.SendAsync(productReq);
             var productJson = await productResp.Content.ReadAsStringAsync();
-            using var productDoc = JsonDocument.Parse(productJson);
-
-            string productId = "";
-            if (productDoc.RootElement.ValueKind == JsonValueKind.Array && productDoc.RootElement.GetArrayLength() > 0)
-                productId = productDoc.RootElement[0].GetProperty("id").GetString() ?? "";
+            using var pdoc = JsonDocument.Parse(productJson);
+            var productId = "";
+            if (pdoc.RootElement.ValueKind == JsonValueKind.Array && pdoc.RootElement.GetArrayLength() > 0)
+                productId = pdoc.RootElement[0].TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
 
             if (string.IsNullOrEmpty(productId)) return;
 
-            // Stap 2: Upsert prijs
-            var priceUrl = $"{_supabaseUrl}/rest/v1/prices?on_conflict=product_id,store,country";
-            using var priceReq = new HttpRequestMessage(HttpMethod.Post, priceUrl);
-            priceReq.Headers.Add("apikey", _supabaseKey);
-            priceReq.Headers.Add("Authorization", $"Bearer {_supabaseKey}");
-            priceReq.Headers.Add("Prefer", "resolution=merge-duplicates");
-            priceReq.Content = JsonContent.Create(new
-            {
-                product_id = productId,
-                store,
-                country,
-                price,
-                scraped_at = DateTime.UtcNow
-            });
-
-            await _http.SendAsync(priceReq);
-            _logger.LogInformation("Prijs opgeslagen: {Product} @ {Store} {Country} = €{Price}", productName, store, country, price);
+            await client.PostAsJsonAsync(
+                $"{_supabaseUrl}/rest/v1/prices?on_conflict=product_id,store,country", new
+                {
+                    product_id = productId,
+                    store,
+                    country,
+                    price,
+                    scraped_at = DateTime.UtcNow,
+                    source     = "live_scrape",
+                });
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Prijs opslaan mislukt voor {Product}", productName);
-        }
+        catch (Exception ex) { _logger.LogDebug(ex, "Supabase opslaan mislukt"); }
     }
 
     // ─── GOOGLE PLACES ────────────────────────────────────────────
-
     private async Task<List<StoreTemplate>> GetNearbyStoresFromGoogle(
         double lat, double lng, int radiusKm, bool includeBelgium, bool includeGermany)
     {
         var apiKey = _config["GoogleMaps:ApiKey"];
-        string latStr = lat.ToString(CultureInfo.InvariantCulture);
-        string lngStr = lng.ToString(CultureInfo.InvariantCulture);
-        int radiusMeter = Math.Min(radiusKm * 1000, 50000); // max 50km voor Places API
+        if (string.IsNullOrEmpty(apiKey)) return GetFallbackStores(lat, lng);
 
-        var allStores = new List<StoreTemplate>();
+        string latStr    = lat.ToString(CultureInfo.InvariantCulture);
+        string lngStr    = lng.ToString(CultureInfo.InvariantCulture);
+        int    radiusM   = Math.Min(radiusKm * 1000, 50000);
 
-        // Zoek per keten apart — anders mist Google kleine vestigingen
-        // want bij rankby=distance pakt hij maar 20 resultaten en mist hij Bunde/Meerssen
-        string[] searchTerms = { "Albert Heijn", "Jumbo supermarkt", "Lidl", "Aldi", "DM drogerie" };
+        var allStores  = new ConcurrentBag<StoreTemplate>();
+        string[] terms = ["Albert Heijn", "Jumbo supermarkt", "Lidl", "Aldi", "Rewe", "Edeka", "Kaufland", "Netto", "Colruyt", "Delhaize"];
 
-        try
+        await Task.WhenAll(terms.Select(async term =>
         {
-            using var mapsClient = new HttpClient();
-
-            foreach (var term in searchTerms)
+            try
             {
                 var url = $"https://maps.googleapis.com/maps/api/place/nearbysearch/json" +
-                          $"?location={latStr},{lngStr}" +
-                          $"&radius={radiusMeter}" +        // radius ipv rankby=distance → geeft meer resultaten
-                          $"&keyword={Uri.EscapeDataString(term)}" +
-                          $"&type=supermarket&key={apiKey}";
+                          $"?location={latStr},{lngStr}&radius={radiusM}" +
+                          $"&keyword={Uri.EscapeDataString(term)}&type=supermarket&key={apiKey}";
 
-                try
+                var resp = await _http.GetFromJsonAsync<JsonElement>(url);
+                if (!resp.TryGetProperty("results", out var results)) return;
+
+                foreach (var item in results.EnumerateArray())
                 {
-                    var response = await mapsClient.GetFromJsonAsync<JsonElement>(url);
-                    if (!response.TryGetProperty("results", out var results)) continue;
+                    var name     = item.GetProperty("name").GetString() ?? "";
+                    var chain    = MapGoogleNameToChain(name);
+                    if (chain == "Onbekend") continue;
 
-                    foreach (var item in results.EnumerateArray())
+                    var storeLat = item.GetProperty("geometry").GetProperty("location").GetProperty("lat").GetDouble();
+                    var storeLng = item.GetProperty("geometry").GetProperty("location").GetProperty("lng").GetDouble();
+                    var vicinity = item.TryGetProperty("vicinity", out var v) ? v.GetString() ?? "" : "";
+
+                    var countryCode = DetectCountry(storeLat, storeLng);
+                    if (countryCode == "BE" && !includeBelgium) continue;
+                    if (countryCode == "DE" && !includeGermany) continue;
+
+                    double dist = CalculateHaversineDistance(lat, lng, storeLat, storeLng);
+                    if (dist > radiusKm) continue;
+
+                    bool openNow = item.TryGetProperty("opening_hours", out var oh) &&
+                                   oh.TryGetProperty("open_now", out var on) && on.GetBoolean();
+
+                    allStores.Add(new StoreTemplate
                     {
-                        string googleName = item.GetProperty("name").GetString() ?? "";
-                        var storeLat = item.GetProperty("geometry").GetProperty("location").GetProperty("lat").GetDouble();
-                        var storeLng = item.GetProperty("geometry").GetProperty("location").GetProperty("lng").GetDouble();
-                        string vicinity = item.TryGetProperty("vicinity", out var v) ? v.GetString() ?? "" : "";
-
-                        var chain = MapGoogleNameToChain(googleName);
-                        if (chain == "Onbekend") continue;
-
-                        string country = DetectCountry(storeLat, storeLng);
-                        if (country == "BE" && !includeBelgium) continue;
-                        if (country == "DE" && !includeGermany) continue;
-
-                        double distanceKm = CalculateHaversineDistance(lat, lng, storeLat, storeLng);
-                        if (distanceKm > radiusKm) continue;
-
-                        allStores.Add(new StoreTemplate
-                        {
-                            Chain            = chain,
-                            City             = ExtractCity(vicinity),
-                            Address          = vicinity,
-                            Latitude         = storeLat,
-                            Longitude        = storeLng,
-                            DistanceKm       = distanceKm,
-                            DriveTimeMinutes = EstimateDriveTime(distanceKm),
-                            Country          = country
-                        });
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Places zoekopdracht mislukt voor {Term}", term);
+                        Chain            = chain,
+                        City             = ExtractCity(vicinity),
+                        Address          = vicinity,
+                        Latitude         = storeLat,
+                        Longitude        = storeLng,
+                        DistanceKm       = Math.Round(dist, 1),
+                        DriveTimeMinutes = EstimateDriveTime(dist),
+                        Country          = countryCode,
+                        OpenNow          = openNow,
+                    });
                 }
             }
+            catch (Exception ex) { _logger.LogWarning(ex, "Places fout voor {Term}", term); }
+        }));
 
-            // Dedupliceer alleen op GPS (afronden op 3 decimalen = ~100m nauwkeurig)
-            // Zo blijven Aldi Bunde, Aldi Maastricht etc. allemaal apart staan
-            return allStores
-                .GroupBy(s => $"{Math.Round(s.Latitude, 3)}|{Math.Round(s.Longitude, 3)}")
-                .Select(g => g.OrderBy(s => s.DistanceKm).First())
-                .OrderBy(s => s.DistanceKm)
-                .Take(20)
-                .ToList();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Google Places API fout");
-            return new List<StoreTemplate>();
-        }
+        return allStores
+            .GroupBy(s => $"{Math.Round(s.Latitude, 3)}|{Math.Round(s.Longitude, 3)}")
+            .Select(g => g.OrderBy(s => s.DistanceKm).First())
+            .OrderBy(s => s.DistanceKm)
+            .Take(20)
+            .ToList();
     }
 
-    // ─── HELPERS ──────────────────────────────────────────────────
+    private static List<StoreTemplate> GetFallbackStores(double lat, double lng) =>
+    [
+        new() { Chain="Albert Heijn", City="Maastricht", Country="NL", DistanceKm=1.2, DriveTimeMinutes=4,  OpenNow=true, Latitude=lat+0.01, Longitude=lng },
+        new() { Chain="Jumbo",        City="Maastricht", Country="NL", DistanceKm=2.1, DriveTimeMinutes=7,  OpenNow=true, Latitude=lat+0.02, Longitude=lng },
+        new() { Chain="Lidl",         City="Maastricht", Country="NL", DistanceKm=3.4, DriveTimeMinutes=10, OpenNow=true, Latitude=lat+0.03, Longitude=lng },
+        new() { Chain="Aldi",         City="Maastricht", Country="NL", DistanceKm=4.2, DriveTimeMinutes=12, OpenNow=true, Latitude=lat+0.04, Longitude=lng },
+    ];
 
+    // ─── HELPERS ──────────────────────────────────────────────────
     private static string DetectCountry(double lat, double lng)
     {
         if (lat >= 50.75 && lat <= 53.55 && lng >= 3.36 && lng <= 7.23) return "NL";
         if (lat >= 49.50 && lat <= 51.50 && lng >= 2.54 && lng <= 6.41) return "BE";
-        if (lat >= 47.27 && lat <= 55.10 && lng >= 5.87 && lng <= 15.04) return "DE";
-        return "NL";
+        return "DE";
     }
 
-    private static int EstimateDriveTime(double distKm) => (int)(distKm / 0.6);
+    private static int EstimateDriveTime(double distKm) => Math.Max(2, (int)(distKm / 0.6));
 
-    private string MapGoogleNameToChain(string name)
+    private static string MapGoogleNameToChain(string name)
     {
-        name = name.ToLower();
-        if (name.Contains("albert heijn") || name.Contains("ah to go")) return "Albert Heijn";
-        if (name.Contains("jumbo"))          return "Jumbo";
-        if (name.Contains("lidl"))           return "Lidl";
-        if (name.Contains("aldi süd") || name.Contains("aldi sued")) return "Aldi Süd";
-        if (name.Contains("aldi"))           return "Aldi";
-        if (name.Contains("dm-drogerie") || name.Contains("dm drogerie") || name == "dm") return "DM";
-        if (name.Contains("rewe"))           return "Rewe";
-        if (name.Contains("edeka"))          return "Edeka";
-        if (name.Contains("kaufland"))       return "Kaufland";
-        if (name.Contains("netto"))          return "Netto";
-        if (name.Contains("penny"))          return "Penny";
-        if (name.Contains("kruidvat"))       return "Kruidvat";
-        if (name.Contains("action"))         return "Action";
-        if (name.Contains("dirk"))           return "Dirk";
-        if (name.Contains("plus"))           return "Plus";
-        if (name.Contains("hoogvliet"))      return "Hoogvliet";
-        if (name.Contains("colruyt"))        return "Colruyt";
-        if (name.Contains("delhaize"))       return "Delhaize";
+        var n = name.ToLower();
+        if (n.Contains("albert heijn") || n.Contains("ah to go")) return "Albert Heijn";
+        if (n.Contains("jumbo"))         return "Jumbo";
+        if (n.Contains("lidl"))          return "Lidl";
+        if (n.Contains("aldi süd") || n.Contains("aldi sued")) return "Aldi Süd";
+        if (n.Contains("aldi"))          return "Aldi";
+        if (n.Contains("rewe"))          return "Rewe";
+        if (n.Contains("edeka"))         return "Edeka";
+        if (n.Contains("kaufland"))      return "Kaufland";
+        if (n.Contains("netto"))         return "Netto";
+        if (n.Contains("colruyt"))       return "Colruyt";
+        if (n.Contains("delhaize"))      return "Delhaize";
+        if (n.Contains("dirk"))          return "Dirk";
+        if (n.Contains("plus"))          return "Plus";
         return "Onbekend";
     }
 
     private static string ExtractCity(string vicinity)
     {
-        // Pakt het laatste deel na de laatste komma (stad)
-        // Bijv. "Molenstraat 12, Beek" → "Beek"
         var parts = vicinity.Split(',');
         return parts.Length > 1 ? parts.Last().Trim() : vicinity.Trim();
     }
 
-    private static decimal CalculateFuelCosts(double distKm, decimal consumptionL, string country)
+    private static decimal CalculateFuelCosts(double distKm, decimal consumptionL, string country, CompareRequest request)
     {
-        decimal fuelPrice = country switch { "BE" => 1.72m, "DE" => 1.61m, _ => 1.89m };
-        return (decimal)(distKm * 2) * (consumptionL / 100) * fuelPrice;
+        decimal fuelPrice = country switch
+        {
+            "BE" => request.FuelPriceBe ?? 1.72m,
+            "DE" => request.FuelPriceDe ?? 1.61m,
+            _    => request.FuelPriceNl ?? 1.89m,
+        };
+        decimal cost = (decimal)(distKm * 2) * (consumptionL / 100m) * fuelPrice;
+        return Math.Round(cost, 1);
     }
 
     private static double CalculateHaversineDistance(double lat1, double lon1, double lat2, double lon2)
@@ -418,9 +517,9 @@ public class CompareService
         const double R = 6371;
         var dLat = (lat2 - lat1) * Math.PI / 180;
         var dLon = (lon2 - lon1) * Math.PI / 180;
-        var a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
-                Math.Cos(lat1 * Math.PI / 180) * Math.Cos(lat2 * Math.PI / 180) *
-                Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+        var a    = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
+                   Math.Cos(lat1 * Math.PI / 180) * Math.Cos(lat2 * Math.PI / 180) *
+                   Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
         return R * 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
     }
 }
