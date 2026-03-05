@@ -38,20 +38,20 @@ public class RoutingService
                     var loc = result.GetProperty("geometry").GetProperty("location");
                     var address = result.TryGetProperty("vicinity", out var v) ? v.GetString() : "";
 
-                    // Land herkenning op basis van adres
+                    // Land herkenning op basis van coordinaten (betrouwbaarder dan adrestekst)
+                    double sLatitude = loc.GetProperty("lat").GetDouble();
+                    double sLongitude = loc.GetProperty("lng").GetDouble();
                     string country = "NL";
-                    if (address != null)
-                    {
-                        if (address.Contains("Germany") || address.Contains("Deutschland")) country = "DE";
-                        else if (address.Contains("Belgium") || address.Contains("België") || address.Contains("Belgique")) country = "BE";
-                    }
+                    if (sLat >= 50.75 && sLat <= 51.80 && sLng >= 5.55 && sLng <= 6.25) country = "NL";
+                    else if (sLat >= 47.0 && sLat <= 55.0 && sLng >= 6.0 && sLng <= 15.0) country = "DE";
+                    else if (sLat >= 49.5 && sLat <= 51.5 && sLng >= 2.5 && sLng <= 6.4) country = "BE";
 
                     stores.Add(new StoreTemplate
                     {
                         Chain = chain,
                         Country = country,
-                        Lat = loc.GetProperty("lat").GetDouble(),
-                        Lng = loc.GetProperty("lng").GetDouble(),
+                        Latitude = loc.GetProperty("lat").GetDouble(),
+                        Longitude = loc.GetProperty("lng").GetDouble(),
                         City = address ?? "Onbekende locatie"
                     });
                 }

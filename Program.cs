@@ -16,7 +16,7 @@ builder.Services.AddCors(o => o.AddPolicy("AllowAll",
     p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
 
 // ─── Helpers voor Polly retry + circuit breaker ────────────────────
-static IHttpClientBuilder AddScraperResilience(IHttpClientBuilder b) =>
+static void AddScraperResilience(IHttpClientBuilder b) =>
     b.AddStandardResilienceHandler(o =>
     {
         o.Retry.MaxRetryAttempts = 3;

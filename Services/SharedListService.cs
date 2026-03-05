@@ -32,7 +32,7 @@ public class SharedListService
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Content-Type",   "application/json");
     }
 
-    // ─── LIJST AANMAKEN ──────────────────────────────────────────
+    // âââ LIJST AANMAKEN ââââââââââââââââââââââââââââââââââââââââââ
 
     public async Task<SharedList?> CreateListAsync(CreateSharedListRequest request)
     {
@@ -65,7 +65,7 @@ public class SharedListService
         }
     }
 
-    // ─── LIJSTEN VAN EEN GEBRUIKER ───────────────────────────────
+    // âââ LIJSTEN VAN EEN GEBRUIKER âââââââââââââââââââââââââââââââ
 
     public async Task<List<SharedList>> GetListsForUserAsync(string userId)
     {
@@ -94,7 +94,7 @@ public class SharedListService
         }
     }
 
-    // ─── LIJST OPHALEN ───────────────────────────────────────────
+    // âââ LIJST OPHALEN âââââââââââââââââââââââââââââââââââââââââââ
 
     public async Task<SharedList?> GetListAsync(string listId)
     {
@@ -117,7 +117,7 @@ public class SharedListService
         }
     }
 
-    // ─── ITEM TOEVOEGEN ──────────────────────────────────────────
+    // âââ ITEM TOEVOEGEN ââââââââââââââââââââââââââââââââââââââââââ
 
     public async Task<SharedListItem?> AddItemAsync(string listId, AddItemToListRequest request)
     {
@@ -125,8 +125,7 @@ public class SharedListService
         {
             var item = request.Item;
             item.Id          = Guid.NewGuid().ToString();
-            item.AddedById   = request.UserId;
-            item.AddedByName = request.UserName;
+            // AddedById/AddedByName worden via item object meegegeven vanuit de frontend
             item.AddedAt     = DateTime.UtcNow;
             item.Checked     = false;
 
@@ -164,7 +163,7 @@ public class SharedListService
         }
     }
 
-    // ─── ITEM UPDATEN (aanvinken / hoeveelheid) ──────────────────
+    // âââ ITEM UPDATEN (aanvinken / hoeveelheid) ââââââââââââââââââ
 
     public async Task<bool> UpdateItemAsync(string listId, string itemId, UpdateItemRequest request)
     {
@@ -192,7 +191,7 @@ public class SharedListService
         }
     }
 
-    // ─── ITEM VERWIJDEREN ────────────────────────────────────────
+    // âââ ITEM VERWIJDEREN ââââââââââââââââââââââââââââââââââââââââ
 
     public async Task<bool> DeleteItemAsync(string listId, string itemId)
     {
@@ -210,7 +209,7 @@ public class SharedListService
         }
     }
 
-    // ─── LIJST LEEGMAKEN (aangevinkte items verwijderen) ─────────
+    // âââ LIJST LEEGMAKEN (aangevinkte items verwijderen) âââââââââ
 
     public async Task<int> ClearCheckedItemsAsync(string listId)
     {
@@ -239,7 +238,7 @@ public class SharedListService
         }
     }
 
-    // ─── LID UITNODIGEN ──────────────────────────────────────────
+    // âââ LID UITNODIGEN ââââââââââââââââââââââââââââââââââââââââââ
 
     public async Task<bool> InviteMemberAsync(string listId, InviteMemberRequest request)
     {
@@ -273,7 +272,7 @@ public class SharedListService
         }
     }
 
-    // ─── LIJST VERWIJDEREN ───────────────────────────────────────
+    // âââ LIJST VERWIJDEREN âââââââââââââââââââââââââââââââââââââââ
 
     public async Task<bool> DeleteListAsync(string listId, string requestingUserId)
     {
@@ -294,7 +293,7 @@ public class SharedListService
         }
     }
 
-    // ─── HELPERS ─────────────────────────────────────────────────
+    // âââ HELPERS âââââââââââââââââââââââââââââââââââââââââââââââââ
 
     private async Task<List<SharedListItem>> GetItemsForListAsync(string listId)
     {
@@ -318,7 +317,7 @@ public class SharedListService
                 AddedByName = item.TryGetProperty("added_by_name", out var abn)  ? abn.GetString()  ?? "" : "",
                 ImageUrl    = item.TryGetProperty("image_url",     out var img)  ? img.GetString()       : null,
                 Category    = item.TryGetProperty("category",      out var cat)  ? cat.GetString()       : null,
-                Emoji       = item.TryGetProperty("emoji",         out var em)   ? em.GetString()   ?? "🛒" : "🛒",
+                Emoji       = item.TryGetProperty("emoji",         out var em)   ? em.GetString()   ?? "ð" : "ð",
             }).ToList();
         }
         catch (Exception ex)
