@@ -140,7 +140,9 @@ app.MapGet("/", () => new
 var healthService = app.Services.GetRequiredService<ScraperHealthService>();
 _ = Task.Run(() => healthService.RunHealthChecksAsync());
 
-var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
+// Railway injecteert PORT als env variabele (standaard 8080)
+// Expliciet binden zodat de healthcheck /health bereikbaar is
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 Console.WriteLine($"🛒 SmartShopper API v3.0 gestart op poort {port}");
 
-app.Run();
+app.Run($"http://0.0.0.0:{port}");

@@ -128,7 +128,9 @@ public class LidlScraper
                 ? $"https://www.lidl.de/suche?query={Uri.EscapeDataString(query)}"
                 : $"https://www.{domain}/zoeken/?q={Uri.EscapeDataString(query)}";
 
-            var html = await _http.GetStringAsync(url);
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+            var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
 
@@ -213,7 +215,9 @@ public class AldiScraper
         {
             var domain = country == "BE" ? "aldi.be" : "aldi.nl";
             var url    = $"https://www.{domain}/nl/zoeken.html?q={Uri.EscapeDataString(query)}";
-            var html   = await _http.GetStringAsync(url);
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+            var html   = await response.Content.ReadAsStringAsync();
             var doc    = new HtmlDocument();
             doc.LoadHtml(html);
             return ExtractAldiPrice(doc, query);
@@ -262,7 +266,9 @@ public class AldiScraper
         try
         {
             var url  = $"https://www.aldi-sued.de/de/sortiment/suche.html?q={Uri.EscapeDataString(query)}";
-            var html = await _http.GetStringAsync(url);
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+            var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
             return ExtractAldiPrice(doc, query);
@@ -368,7 +374,9 @@ public class DmScraper
         {
             var domain = country == "DE" ? "dm.de" : "dm.nl";
             var url    = $"https://www.{domain}/search?query={Uri.EscapeDataString(item.Name)}";
-            var html   = await _http.GetStringAsync(url);
+            var resp   = await _http.GetAsync(url);
+            if (!resp.IsSuccessStatusCode) return [];
+            var html   = await resp.Content.ReadAsStringAsync();
             var doc    = new HtmlDocument();
             doc.LoadHtml(html);
 
@@ -482,7 +490,9 @@ public class ReweScraper
         try
         {
             var url  = $"https://www.rewe.de/suche/?search={Uri.EscapeDataString(item.Name)}";
-            var html = await _http.GetStringAsync(url);
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return [];
+            var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
 
@@ -589,7 +599,9 @@ public class EdekaScraper
         try
         {
             var url  = $"https://www.edeka.de/produkte/suchergebnis.jsp?query={Uri.EscapeDataString(item.Name)}";
-            var html = await _http.GetStringAsync(url);
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return [];
+            var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
 

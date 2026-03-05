@@ -96,7 +96,9 @@ public class ColruytScraper
         try
         {
             var url  = $"https://www.colruyt.be/nl/zoekopdracht/{Uri.EscapeDataString(query)}";
-            var html = await _http.GetStringAsync(url);
+            var resp = await _http.GetAsync(url);
+            if (!resp.IsSuccessStatusCode) return null;
+            var html = await resp.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
 
@@ -271,7 +273,9 @@ public class DelhaizeScraper
         try
         {
             var url  = $"https://www.delhaize.be/nl-be/recherche?text={Uri.EscapeDataString(query)}";
-            var html = await _http.GetStringAsync(url);
+            var resp = await _http.GetAsync(url);
+            if (!resp.IsSuccessStatusCode) return null;
+            var html = await resp.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
 
