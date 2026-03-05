@@ -1,6 +1,5 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "dotnet publish -c Release -o /app/publish"
 
 [deploy]
 startCommand = "dotnet SmartShopper.API.dll"
@@ -15,7 +14,3 @@ name = "smartshopper-api"
 [services.variables]
 ASPNETCORE_ENVIRONMENT = "Production"
 ASPNETCORE_URLS = "http://0.0.0.0:$PORT"
-# Stel deze in via Railway Dashboard → Variables:
-# SUPABASE_ANON_KEY = eyJ...
-# SUPABASE_SERVICE_KEY = sb_secret_...
-# GOOGLE_MAPS_API_KEY = AIza...
