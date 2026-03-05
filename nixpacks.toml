@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ['dotnet-sdk_9']
+nixPkgs = ['dotnet-sdk_9_0']
 
 [phases.build]
 cmds = ['dotnet publish -c Release -o /app/publish']
