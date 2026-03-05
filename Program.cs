@@ -46,6 +46,7 @@ builder.Services.AddHttpClient<IntelligenceService>(c => c.Timeout = TimeSpan.Fr
 builder.Services.AddHttpClient<SharedListService>(c => c.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddHttpClient<RoutingService>(c => c.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddHttpClient<ScraperHealthService>(c => c.Timeout = TimeSpan.FromSeconds(12));
+builder.Services.AddHttpClient<ConsentService>(c => c.Timeout = TimeSpan.FromSeconds(10));
 
 // ─── Scraper registraties (Scoped) ───────────────────────────────
 builder.Services.AddScoped<AlbertHeijnScraper>();
@@ -63,6 +64,7 @@ builder.Services.AddScoped<CompareService>();
 builder.Services.AddScoped<IntelligenceService>();
 builder.Services.AddScoped<SharedListService>();
 builder.Services.AddScoped<RoutingService>();
+builder.Services.AddScoped<ConsentService>();
 
 // ─── Health service (Singleton — houdt status bij) ───────────────
 builder.Services.AddSingleton<ScraperHealthService>();

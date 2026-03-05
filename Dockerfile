@@ -3,11 +3,11 @@ WORKDIR /app
 COPY *.csproj .
 RUN dotnet restore
 COPY . .
-RUN dotnet publish -c Release -o out --no-restore
+RUN dotnet publish -c Release -o /app/publish
 
 FROM mcr.microsoft.com/dotnet/aspnet:9.0
 WORKDIR /app
-COPY --from=build /app/out .
+COPY --from=build /app/publish .
 ENV ASPNETCORE_URLS=http://0.0.0.0:$PORT
-# cache-bust: 2026-03-05-v3
-ENTRYPOINT ["dotnet", "SmartShopper_API.dll"]
+# cache-bust: 2026-03-05-v4
+ENTRYPOINT ["dotnet", "SmartShopper.API.dll"]

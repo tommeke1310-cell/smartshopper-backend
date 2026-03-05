@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+appsettings.Development.json
+*.user
+*.suo
+.git
+.gitignore
+README.md

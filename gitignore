@@ -1,0 +1,21 @@
+## Visual Studio opschonen
+[Bb]in/
+[Oo]bj/
+out/
+.vs/
+.vscode/
+
+## Gebruikersspecifieke bestanden
+*.user
+*.userosscache
+*.sln.doccache
+
+## OS bestanden
+.DS_Store
+Thumbs.db
+
+## ASP.NET Core — NOOIT secrets in git!
+appsettings.Development.json
+
+## Publish output
+publish/
