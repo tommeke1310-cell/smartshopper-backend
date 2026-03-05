@@ -137,7 +137,7 @@ public class SharedListService
                 name          = item.Name,
                 quantity      = item.Quantity,
                 unit          = item.Unit,
-                checked       = false,
+                @checked      = false,
                 added_by_id   = item.AddedById,
                 added_by_name = item.AddedByName,
                 image_url     = item.ImageUrl,

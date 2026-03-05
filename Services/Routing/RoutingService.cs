@@ -85,3 +85,22 @@ public class RoutingService
                     var km = el.GetProperty("distance").GetProperty("value").GetDouble() / 1000;
                     var min = el.GetProperty("duration").GetProperty("value").GetInt32() / 60;
                     // Kosten berekening: (Afstand * 2 voor retour) * (verb
+                    var fuelCost = (decimal)(km * 2) * (decimal)(consumption / 100) * fuelPrice;
+                    return (Math.Round(km, 1), min, Math.Round(fuelCost, 2));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Distance Matrix fout");
+        }
+
+        // Fallback: schatting op basis van hemelsbreede afstand
+        double distKm = Math.Sqrt(
+            Math.Pow((toLat - fromLat) * 111, 2) +
+            Math.Pow((toLng - fromLng) * 111 * Math.Cos(fromLat * Math.PI / 180), 2));
+        int estMin = Math.Max(2, (int)(distKm / 0.6));
+        decimal estFuel = (decimal)(distKm * 2) * (decimal)(consumption / 100) * fuelPrice;
+        return (Math.Round(distKm, 1), estMin, Math.Round(estFuel, 2));
+    }
+}
