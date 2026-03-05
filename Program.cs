@@ -29,9 +29,24 @@ static void AddScraperResilience(IHttpClientBuilder b) =>
         o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(25);
     });
 
+// Jumbo krijgt eigen resilience: geen retry op 403, kortere timeout
+static void AddJumboResilience(IHttpClientBuilder b) =>
+    b.AddStandardResilienceHandler(o =>
+    {
+        o.Retry.MaxRetryAttempts = 1;
+        o.Retry.Delay = TimeSpan.FromSeconds(1);
+        // Geen circuit breaker voor Jumbo — liever fallback dan open circuit
+        o.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(5);
+        o.CircuitBreaker.FailureRatio = 0.9;
+        o.CircuitBreaker.MinimumThroughput = 20;
+        o.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(30);
+        o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(6);
+        o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(15);
+    });
+
 // ─── HTTP Clients per scraper MET Polly ───────────────────────────
 AddScraperResilience(builder.Services.AddHttpClient<AlbertHeijnScraper>());
-AddScraperResilience(builder.Services.AddHttpClient<JumboScraper>());
+AddJumboResilience(builder.Services.AddHttpClient<JumboScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<LidlScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<AldiScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<DmScraper>());

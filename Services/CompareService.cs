@@ -204,9 +204,19 @@ public class CompareService
             }
         }
 
-        var matches = await ScrapeForStore(item, store, country, ahToken);
+        List<ProductMatch> matches;
+        try
+        {
+            matches = await ScrapeForStore(item, store, country, ahToken);
+        }
+        catch (Exception ex)
+        {
+            // Circuit breaker open of andere Polly exception — direct naar schatting
+            _logger.LogDebug(ex, "Scraper exception voor {Store}/{Product}, gebruik schatting", store, item.Name);
+            matches = [];
+        }
 
-        // Fallback naar Open Food Facts als leeg
+        // Fallback naar Open Food Facts als leeg of geen prijs
         if (!matches.Any() || matches.All(m => m.Price <= 0))
             matches = [await EstimateViaOFF(item, store, country)];
 
