@@ -9,4 +9,4 @@ FROM mcr.microsoft.com/dotnet/aspnet:9.0
 WORKDIR /app
 COPY --from=build /app/publish .
 ENV ASPNETCORE_URLS=http://0.0.0.0:$PORT
-ENTRYPOINT ["dotnet", "SmartShopper.API.dll"]
+ENTRYPOINT ["dotnet", "SmartShopper_API.dll"]
