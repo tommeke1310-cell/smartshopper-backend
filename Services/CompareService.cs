@@ -19,6 +19,8 @@ public class CompareService
     private readonly AldiScraper _aldiScraper;
     private readonly ReweScraper _reweScraper;
     private readonly EdekaScraper _edekaScraper;
+    private readonly ColruytScraper _colruytScraper;
+    private readonly DelhaizeScraper _delhaizeScraper;
 
     private readonly string _supabaseUrl;
     private readonly string _supabaseKey;
@@ -33,7 +35,8 @@ public class CompareService
     public CompareService(
         HttpClient http, IConfiguration config, ILogger<CompareService> logger,
         AlbertHeijnScraper ah, JumboScraper jumbo, LidlScraper lidl,
-        AldiScraper aldi, ReweScraper rewe, EdekaScraper edeka)
+        AldiScraper aldi, ReweScraper rewe, EdekaScraper edeka,
+        ColruytScraper colruyt, DelhaizeScraper delhaize)
     {
         _http = http;
         _config = config;
@@ -44,6 +47,8 @@ public class CompareService
         _aldiScraper = aldi;
         _reweScraper = rewe;
         _edekaScraper = edeka;
+        _colruytScraper = colruyt;
+        _delhaizeScraper = delhaize;
 
         _supabaseUrl = config["Supabase:Url"] ?? "";
         _supabaseKey = config["Supabase:ServiceKey"] ?? config["Supabase:AnonKey"] ?? "";
@@ -224,6 +229,8 @@ public class CompareService
             "Aldi Süd"     => await _aldiScraper.SearchProductAsync(item, "DE"),
             "Rewe"         => await _reweScraper.SearchProductAsync(item),
             "Edeka"        => await _edekaScraper.SearchProductAsync(item),
+            "Colruyt"      => await _colruytScraper.SearchProductAsync(item),
+            "Delhaize"     => await _delhaizeScraper.SearchProductAsync(item),
             _              => []
         };
     }
@@ -491,15 +498,16 @@ public class CompareService
         int radiusM = Math.Min(radiusKm * 1000, 50000);
 
         var allStores = new ConcurrentBag<StoreTemplate>();
-        string[] terms = ["Albert Heijn", "Jumbo supermarkt", "Lidl", "Aldi", "Rewe", "Edeka"];
+        string[] terms = ["Albert Heijn", "Jumbo", "Lidl", "Aldi", "Rewe", "Edeka", "Colruyt", "Delhaize"];
 
         await Task.WhenAll(terms.Select(async term =>
         {
             try
             {
+                // type=supermarket weglaten — te restrictief, Jumbo/Colruyt missen anders
                 var url = $"https://maps.googleapis.com/maps/api/place/nearbysearch/json" +
                           $"?location={latStr},{lngStr}&radius={radiusM}" +
-                          $"&keyword={Uri.EscapeDataString(term)}&type=supermarket&key={_mapsKey}";
+                          $"&keyword={Uri.EscapeDataString(term)}&key={_mapsKey}";
 
                 var resp = await _http.GetFromJsonAsync<JsonElement>(url);
                 if (!resp.TryGetProperty("results", out var results)) return;
@@ -637,16 +645,19 @@ public class CompareService
     private static string MapGoogleNameToChain(string name)
     {
         var n = name.ToLower();
-        if (n.Contains("albert heijn") || n.Contains("ah to go")) return "Albert Heijn";
+        if (n.Contains("albert heijn") || n.Contains("ah to go") || n.Contains("ah xl")) return "Albert Heijn";
         if (n.Contains("jumbo")) return "Jumbo";
         if (n.Contains("lidl")) return "Lidl";
-        if (n.Contains("aldi süd") || n.Contains("aldi sued")) return "Aldi Süd";
+        if (n.Contains("aldi süd") || n.Contains("aldi sued") || n.Contains("aldi sud")) return "Aldi Süd";
         if (n.Contains("aldi")) return "Aldi";
         if (n.Contains("rewe")) return "Rewe";
         if (n.Contains("edeka")) return "Edeka";
+        if (n.Contains("colruyt")) return "Colruyt";
+        if (n.Contains("delhaize") || n.Contains("ad delhaize")) return "Delhaize";
         if (n.Contains("kaufland")) return "Kaufland";
         if (n.Contains("dirk")) return "Dirk";
         if (n.Contains("plus")) return "Plus";
+        if (n.Contains("spar")) return "Spar";
         return "Onbekend";
     }
 
