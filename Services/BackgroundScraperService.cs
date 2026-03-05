@@ -1,6 +1,7 @@
 using SmartShopper.API.Models;
 using SmartShopper.API.Services.Scrapers;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text;
 
 namespace SmartShopper.API.Services;
@@ -43,6 +44,20 @@ public class BackgroundScraperService : BackgroundService
 
         // Kleine vertraging bij opstart zodat de rest van de app klaar is
         await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken);
+
+        // Valideer config direct bij opstart
+        var supabaseUrl = _config["Supabase:Url"];
+        var supabaseKey = _config["Supabase:ServiceKey"];
+
+        if (string.IsNullOrEmpty(supabaseUrl) || string.IsNullOrEmpty(supabaseKey))
+        {
+            _logger.LogError("❌ Supabase config ontbreekt! Supabase:Url={Url}, Supabase:ServiceKey={Key}",
+                string.IsNullOrEmpty(supabaseUrl) ? "LEEG" : "ok",
+                string.IsNullOrEmpty(supabaseKey) ? "LEEG" : "ok");
+            return;
+        }
+
+        _logger.LogInformation("✅ Supabase config gevonden: {Url}", supabaseUrl);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -194,10 +209,7 @@ public class BackgroundScraperService : BackgroundService
         {
             using var http = CreateSupabaseClient();
             var url  = $"{_config["Supabase:Url"]}/rest/v1/prices";
-            var json = JsonSerializer.Serialize(rows, new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
-            });
+            var json = JsonSerializer.Serialize(rows);
 
             using var req = new HttpRequestMessage(HttpMethod.Post, url);
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -251,17 +263,21 @@ public class BackgroundScraperService : BackgroundService
 
     // ─── Interne models ──────────────────────────────────────────────
 
-    private record ProductInfo(string Id, string Name, string? SearchQuery);
+    private record ProductInfo(
+        [property: JsonPropertyName("id")]           string Id,
+        [property: JsonPropertyName("name")]         string Name,
+        [property: JsonPropertyName("search_query")] string? SearchQuery
+    );
 
     private class PriceRow
     {
-        public string   ProductId   { get; set; } = "";
-        public string   Store       { get; set; } = "";
-        public string   Country     { get; set; } = "";
-        public decimal  Price       { get; set; }
-        public bool     IsPromo     { get; set; }
-        public bool     IsEstimated { get; set; }
-        public string   Source      { get; set; } = "scraper";
-        public DateTime ScrapedAt   { get; set; } = DateTime.UtcNow;
+        [JsonPropertyName("product_id")]   public string   ProductId   { get; set; } = "";
+        [JsonPropertyName("store")]        public string   Store       { get; set; } = "";
+        [JsonPropertyName("country")]      public string   Country     { get; set; } = "";
+        [JsonPropertyName("price")]        public decimal  Price       { get; set; }
+        [JsonPropertyName("is_promo")]     public bool     IsPromo     { get; set; }
+        [JsonPropertyName("is_estimated")] public bool     IsEstimated { get; set; }
+        [JsonPropertyName("source")]       public string   Source      { get; set; } = "scraper";
+        [JsonPropertyName("scraped_at")]   public DateTime ScrapedAt   { get; set; } = DateTime.UtcNow;
     }
 }
