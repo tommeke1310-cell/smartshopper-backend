@@ -39,8 +39,8 @@ public class RoutingService
                     var address = result.TryGetProperty("vicinity", out var v) ? v.GetString() : "";
 
                     // Land herkenning op basis van coordinaten (betrouwbaarder dan adrestekst)
-                    double sLatitude = loc.GetProperty("lat").GetDouble();
-                    double sLongitude = loc.GetProperty("lng").GetDouble();
+                    double sLat = loc.GetProperty("lat").GetDouble();
+                    double sLng = loc.GetProperty("lng").GetDouble();
                     string country = "NL";
                     if (sLat >= 50.75 && sLat <= 51.80 && sLng >= 5.55 && sLng <= 6.25) country = "NL";
                     else if (sLat >= 47.0 && sLat <= 55.0 && sLng >= 6.0 && sLng <= 15.0) country = "DE";
@@ -50,8 +50,8 @@ public class RoutingService
                     {
                         Chain = chain,
                         Country = country,
-                        Latitude = loc.GetProperty("lat").GetDouble(),
-                        Longitude = loc.GetProperty("lng").GetDouble(),
+                        Latitude = sLat,
+                        Longitude = sLng,
                         City = address ?? "Onbekende locatie"
                     });
                 }
@@ -84,7 +84,7 @@ public class RoutingService
                 {
                     var km = el.GetProperty("distance").GetProperty("value").GetDouble() / 1000;
                     var min = el.GetProperty("duration").GetProperty("value").GetInt32() / 60;
-                    // Kosten berekening: (Afstand * 2 voor retour) * (verb
+                    // Kosten berekening: (Afstand * 2 voor retour) * (verbruik/100) * brandstofprijs
                     var fuelCost = (decimal)(km * 2) * (decimal)(consumption / 100) * fuelPrice;
                     return (Math.Round(km, 1), min, Math.Round(fuelCost, 2));
                 }
