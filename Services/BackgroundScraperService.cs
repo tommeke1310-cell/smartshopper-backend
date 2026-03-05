@@ -17,25 +17,38 @@ namespace SmartShopper.API.Services;
 /// </summary>
 public class BackgroundScraperService : BackgroundService
 {
-    private readonly IServiceProvider          _services;
     private readonly ILogger<BackgroundScraperService> _logger;
     private readonly IConfiguration            _config;
+    private readonly LidlScraper               _lidlScraper;
+    private readonly AldiScraper               _aldiScraper;
+    private readonly ReweScraper               _reweScraper;
+    private readonly EdekaScraper              _edekaScraper;
+    private readonly ColruytScraper            _colruytScraper;
+    private readonly DelhaizeScraper           _delhaizeScraper;
 
     // Interval tussen scrape-runs
     private static readonly TimeSpan SCRAPE_INTERVAL  = TimeSpan.FromHours(6);
     // Wachttijd tussen individuele requests (voorkomt rate limiting)
     private static readonly TimeSpan REQUEST_DELAY    = TimeSpan.FromMilliseconds(800);
-    // Wachttijd na een geblokkeerde store (429/403)
-    private static readonly TimeSpan BACKOFF_DELAY    = TimeSpan.FromSeconds(30);
 
     public BackgroundScraperService(
-        IServiceProvider services,
         ILogger<BackgroundScraperService> logger,
-        IConfiguration config)
+        IConfiguration config,
+        LidlScraper lidl,
+        AldiScraper aldi,
+        ReweScraper rewe,
+        EdekaScraper edeka,
+        ColruytScraper colruyt,
+        DelhaizeScraper delhaize)
     {
-        _services = services;
-        _logger   = logger;
-        _config   = config;
+        _logger          = logger;
+        _config          = config;
+        _lidlScraper     = lidl;
+        _aldiScraper     = aldi;
+        _reweScraper     = rewe;
+        _edekaScraper    = edeka;
+        _colruytScraper  = colruyt;
+        _delhaizeScraper = delhaize;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -79,16 +92,6 @@ public class BackgroundScraperService : BackgroundService
     {
         _logger.LogInformation("🛒 Scrape-run gestart om {Time}", DateTime.UtcNow);
 
-        using var scope = _services.CreateScope();
-
-        var ahScraper       = scope.ServiceProvider.GetRequiredService<AlbertHeijnScraper>();
-        var lidlScraper     = scope.ServiceProvider.GetRequiredService<LidlScraper>();
-        var aldiScraper     = scope.ServiceProvider.GetRequiredService<AldiScraper>();
-        var reweScraper     = scope.ServiceProvider.GetRequiredService<ReweScraper>();
-        var edekaScraper    = scope.ServiceProvider.GetRequiredService<EdekaScraper>();
-        var colruytScraper  = scope.ServiceProvider.GetRequiredService<ColruytScraper>();
-        var delhaizeScraper = scope.ServiceProvider.GetRequiredService<DelhaizeScraper>();
-
         // Haal alle producten op uit Supabase
         var products = await FetchAllProductsAsync();
         if (products.Count == 0)
@@ -106,22 +109,18 @@ public class BackgroundScraperService : BackgroundService
 
             var item = new GroceryItem { Id = product.Id, Name = product.Name };
 
-            // Definieer welke scrapers voor welk land draaien
             var scraperTasks = new List<(string store, string country, Task<List<ProductMatch>> task)>
             {
-                // NL
-                ("Lidl",         "NL", lidlScraper.SearchProductAsync(item, "NL")),
-                ("Aldi",         "NL", aldiScraper.SearchProductAsync(item, "NL")),
-                // BE
-                ("Lidl",         "BE", lidlScraper.SearchProductAsync(item, "BE")),
-                ("Aldi",         "BE", aldiScraper.SearchProductAsync(item, "BE")),
-                ("Colruyt",      "BE", colruytScraper.SearchProductAsync(item)),
-                ("Delhaize",     "BE", delhaizeScraper.SearchProductAsync(item)),
-                // DE
-                ("Lidl",         "DE", lidlScraper.SearchProductAsync(item, "DE")),
-                ("Aldi Süd",     "DE", aldiScraper.SearchProductAsync(item, "DE")),
-                ("Rewe",         "DE", reweScraper.SearchProductAsync(item)),
-                ("Edeka",        "DE", edekaScraper.SearchProductAsync(item)),
+                ("Lidl",     "NL", _lidlScraper.SearchProductAsync(item, "NL")),
+                ("Aldi",     "NL", _aldiScraper.SearchProductAsync(item, "NL")),
+                ("Lidl",     "BE", _lidlScraper.SearchProductAsync(item, "BE")),
+                ("Aldi",     "BE", _aldiScraper.SearchProductAsync(item, "BE")),
+                ("Colruyt",  "BE", _colruytScraper.SearchProductAsync(item)),
+                ("Delhaize", "BE", _delhaizeScraper.SearchProductAsync(item)),
+                ("Lidl",     "DE", _lidlScraper.SearchProductAsync(item, "DE")),
+                ("Aldi Süd", "DE", _aldiScraper.SearchProductAsync(item, "DE")),
+                ("Rewe",     "DE", _reweScraper.SearchProductAsync(item)),
+                ("Edeka",    "DE", _edekaScraper.SearchProductAsync(item)),
             };
 
             // Wacht op alle scrapers parallel (met timeout per product)

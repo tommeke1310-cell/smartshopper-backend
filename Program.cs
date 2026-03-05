@@ -47,16 +47,16 @@ builder.Services.AddHttpClient<SharedListService>(c => c.Timeout = TimeSpan.From
 builder.Services.AddHttpClient<RoutingService>(c => c.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddHttpClient<ScraperHealthService>(c => c.Timeout = TimeSpan.FromSeconds(12));
 
-// ─── Scraper registraties (Scoped) ───────────────────────────────
-builder.Services.AddScoped<AlbertHeijnScraper>();
-builder.Services.AddScoped<JumboScraper>();
-builder.Services.AddScoped<LidlScraper>();
-builder.Services.AddScoped<AldiScraper>();
-builder.Services.AddScoped<DmScraper>();
-builder.Services.AddScoped<ReweScraper>();
-builder.Services.AddScoped<EdekaScraper>();
-builder.Services.AddScoped<ColruytScraper>();
-builder.Services.AddScoped<DelhaizeScraper>();
+// ─── Scraper registraties (Singleton — nodig voor BackgroundService) ─
+builder.Services.AddSingleton<AlbertHeijnScraper>();
+builder.Services.AddSingleton<JumboScraper>();
+builder.Services.AddSingleton<LidlScraper>();
+builder.Services.AddSingleton<AldiScraper>();
+builder.Services.AddSingleton<DmScraper>();
+builder.Services.AddSingleton<ReweScraper>();
+builder.Services.AddSingleton<EdekaScraper>();
+builder.Services.AddSingleton<ColruytScraper>();
+builder.Services.AddSingleton<DelhaizeScraper>();
 
 // ─── Business services (Scoped) ──────────────────────────────────
 builder.Services.AddScoped<CompareService>();
