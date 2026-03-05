@@ -152,7 +152,13 @@ public class AlbertHeijnScraper
         try
         {
             var url = $"{AH_WEB_SEARCH_URL}?query={Uri.EscapeDataString(item.Name)}&size=5";
-            var response = await _http.GetStringAsync(url);
+            var resp = await _http.GetAsync(url);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("AH Web API: {Status} voor {Product}", resp.StatusCode, item.Name);
+                return [];
+            }
+            var response = await resp.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(response);
 
             if (!doc.RootElement.TryGetProperty("products", out var products)) return [];
@@ -290,5 +296,35 @@ public class AlbertHeijnScraper
             _logger.LogWarning(ex, "AH gebruiker login mislukt");
             return null;
         }
+    }
+}
+
+// ─── Proxy configuratie (per-scraper, activeer via PROXY_URL_AH env var) ──────
+// Zet in Railway: PROXY_URL_AH=http://user:pass@proxy.brightdata.com:22225
+// Als leeg → directe verbinding (huidig gedrag)
+public static class ProxyConfig
+{
+    public static HttpClient CreateClient(string envVarName, ILogger logger)
+    {
+        var proxyUrl = Environment.GetEnvironmentVariable(envVarName);
+        if (!string.IsNullOrEmpty(proxyUrl))
+        {
+            try
+            {
+                var handler = new HttpClientHandler
+                {
+                    Proxy = new System.Net.WebProxy(proxyUrl, true),
+                    UseProxy = true,
+                    ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+                };
+                logger.LogInformation("Proxy actief voor {Env}: {Proxy}", envVarName, proxyUrl);
+                return new HttpClient(handler);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Proxy config mislukt voor {Env}, directe verbinding", envVarName);
+            }
+        }
+        return new HttpClient();
     }
 }

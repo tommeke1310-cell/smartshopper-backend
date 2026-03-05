@@ -450,23 +450,35 @@ public class CompareService
             {
                 foreach (var p in products.EnumerateArray())
                 {
-                    var name = p.TryGetProperty("product_name_nl", out var nl) ? nl.GetString() :
+                    var name = p.TryGetProperty("product_name_nl", out var nl) && !string.IsNullOrEmpty(nl.GetString()) ? nl.GetString() :
+                               p.TryGetProperty("product_name_en", out var en) && !string.IsNullOrEmpty(en.GetString()) ? en.GetString() :
                                p.TryGetProperty("product_name", out var pn) ? pn.GetString() : null;
                     if (string.IsNullOrEmpty(name)) continue;
 
-                    bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase);
+                    bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
+                                 (p.TryGetProperty("labels_tags", out var lbls) &&
+                                  lbls.EnumerateArray().Any(l => l.GetString()?.Contains("organic") == true));
                     bool isVegan = p.TryGetProperty("labels_tags", out var lbt) &&
                                    lbt.EnumerateArray().Any(l => l.GetString()?.Contains("vegan") == true);
 
-                    string category = p.TryGetProperty("categories_tags", out var cats)
-                        ? cats.EnumerateArray().FirstOrDefault().GetString() ?? "" : "";
+                    // Zoek meest specifieke categorie (langste tag = meest specifiek)
+                    string category = "";
+                    if (p.TryGetProperty("categories_tags", out var cats))
+                    {
+                        category = cats.EnumerateArray()
+                            .Select(c => c.GetString() ?? "")
+                            .Where(c => c.StartsWith("en:") || c.StartsWith("nl:"))
+                            .OrderByDescending(c => c.Length)
+                            .FirstOrDefault() ?? cats.EnumerateArray().FirstOrDefault().GetString() ?? "";
+                    }
+
                     decimal price = EstimatePriceFromCategory(category, store, country);
 
                     return new ProductMatch
                     {
                         StoreName = store, Country = country, ProductName = name,
                         Price = price, IsEstimated = true,
-                        IsBiologisch = isBio, IsVegan = isVegan, MatchConfidence = 0.5
+                        IsBiologisch = isBio, IsVegan = isVegan, MatchConfidence = 0.55
                     };
                 }
             }
@@ -483,26 +495,89 @@ public class CompareService
 
     private static decimal EstimatePriceFromCategory(string category, string store, string country)
     {
-        decimal basePrice = category.ToLower() switch
+        // Gebaseerd op gemiddelde NL supermarktprijzen 2024-2025
+        var c = category.ToLower();
+        decimal basePrice =
+            // ── Dranken ──────────────────────────────────────────────────
+            c.Contains("cola") || c.Contains("coca-cola") || c.Contains("pepsi") ? 1.99m :
+            c.Contains("energy-drink") || c.Contains("energy drink")             ? 1.89m :
+            c.Contains("fruit-juice") || c.Contains("vruchtensap")               ? 1.79m :
+            c.Contains("water") && c.Contains("mineral")                         ? 0.89m :
+            c.Contains("beer") || c.Contains("bier")                             ? 1.29m :
+            c.Contains("wine") || c.Contains("wijn")                             ? 6.99m :
+            c.Contains("coffee") || c.Contains("koffie")                         ? 4.49m :
+            c.Contains("tea") || c.Contains("thee")                              ? 2.49m :
+            c.Contains("beverage") || c.Contains("drink") || c.Contains("frisdrank") ? 1.79m :
+            // ── Zuivel ────────────────────────────────────────────────────
+            c.Contains("milk") || c.Contains("melk")                             ? 1.19m :
+            c.Contains("yogurt") || c.Contains("yoghurt")                        ? 1.49m :
+            c.Contains("cheese") || c.Contains("kaas")                           ? 3.49m :
+            c.Contains("butter") || c.Contains("boter")                          ? 2.29m :
+            c.Contains("cream") || c.Contains("room")                            ? 1.89m :
+            c.Contains("dairy") || c.Contains("zuivel")                          ? 1.49m :
+            // ── Bakkerij ──────────────────────────────────────────────────
+            c.Contains("bread") || c.Contains("brood")                           ? 2.49m :
+            c.Contains("pastry") || c.Contains("gebak") || c.Contains("cake")    ? 2.99m :
+            c.Contains("biscuit") || c.Contains("koek") || c.Contains("cookie")  ? 1.99m :
+            c.Contains("cracker")                                                 ? 2.29m :
+            // ── Vlees & Vis ───────────────────────────────────────────────
+            c.Contains("chicken") || c.Contains("kip")                           ? 4.49m :
+            c.Contains("beef") || c.Contains("rundvlees")                        ? 5.99m :
+            c.Contains("pork") || c.Contains("varken")                           ? 4.29m :
+            c.Contains("fish") || c.Contains("vis") || c.Contains("seafood")     ? 4.99m :
+            c.Contains("sausage") || c.Contains("worst") || c.Contains("vleeswaar") ? 2.99m :
+            c.Contains("meat") || c.Contains("vlees")                            ? 4.99m :
+            // ── Groente & Fruit ───────────────────────────────────────────
+            c.Contains("vegetable") || c.Contains("groente")                     ? 1.79m :
+            c.Contains("salad") || c.Contains("sla")                             ? 1.99m :
+            c.Contains("fruit")                                                   ? 2.29m :
+            // ── Maaltijden ────────────────────────────────────────────────
+            c.Contains("pizza")                                                   ? 3.29m :
+            c.Contains("frozen") || c.Contains("diepvries")                      ? 3.49m :
+            c.Contains("soup") || c.Contains("soep")                             ? 1.99m :
+            c.Contains("sauce") || c.Contains("saus")                            ? 2.29m :
+            c.Contains("meal") || c.Contains("maaltijd")                         ? 4.49m :
+            // ── Droogwaren ────────────────────────────────────────────────
+            c.Contains("pasta")                                                   ? 1.59m :
+            c.Contains("rice") || c.Contains("rijst")                            ? 1.99m :
+            c.Contains("cereal") || c.Contains("ontbijtgranen") || c.Contains("muesli") ? 3.49m :
+            c.Contains("chocolate") || c.Contains("chocolade")                   ? 2.49m :
+            c.Contains("chips") || c.Contains("crisps")                          ? 2.29m :
+            c.Contains("candy") || c.Contains("snoep")                           ? 1.99m :
+            c.Contains("oil") || c.Contains("olie")                              ? 2.99m :
+            c.Contains("sugar") || c.Contains("suiker")                          ? 1.29m :
+            c.Contains("flour") || c.Contains("meel")                            ? 1.49m :
+            c.Contains("snack")                                                   ? 2.19m :
+            // ── Verzorging ────────────────────────────────────────────────
+            c.Contains("shampoo")                                                 ? 4.49m :
+            c.Contains("toothpaste") || c.Contains("tandpasta")                  ? 2.99m :
+            c.Contains("detergent") || c.Contains("wasmiddel")                   ? 8.99m :
+            c.Contains("cleaning") || c.Contains("schoonmaak")                   ? 3.99m :
+            c.Contains("soap") || c.Contains("zeep")                             ? 2.49m :
+            c.Contains("toilet") || c.Contains("wc")                             ? 4.99m :
+            c.Contains("diaper") || c.Contains("luier")                          ? 14.99m :
+            c.Contains("baby")                                                    ? 2.29m :
+            2.49m; // algemene fallback
+
+        // Winkel multiplier op basis van marktpositionering NL 2024-2025
+        decimal multiplier = store switch
         {
-            var c when c.Contains("beverages") || c.Contains("drink") || c.Contains("frisdrank") => 1.79m,
-            var c when c.Contains("dairy") || c.Contains("zuivel") || c.Contains("milk") => 1.29m,
-            var c when c.Contains("bread") || c.Contains("brood") => 2.49m,
-            var c when c.Contains("meat") || c.Contains("vlees") => 4.99m,
-            var c when c.Contains("snack") || c.Contains("chips") => 2.19m,
-            var c when c.Contains("frozen") || c.Contains("diepvries") => 3.49m,
-            var c when c.Contains("cleaning") || c.Contains("schoonmaak") => 3.99m,
-            _ => 2.49m
+            "Aldi" or "Aldi BE"               => 0.80m,
+            "Aldi Süd"                        => 0.81m,
+            "Lidl" or "Lidl BE" or "Lidl DE"  => 0.83m,
+            "Netto" or "Kaufland"             => 0.84m,
+            "Dirk"                            => 0.88m,
+            "Colruyt"                         => 0.90m,
+            "Plus" or "Coop" or "Spar"        => 0.96m,
+            "Jumbo"                           => 0.97m,
+            "Delhaize"                        => 0.99m,
+            "Rewe"                            => country == "DE" ? 0.87m : 0.92m,
+            "Edeka"                           => 0.95m,
+            "Albert Heijn"                    => 1.08m,
+            "Carrefour"                       => 0.94m,
+            _                                 => country switch { "DE" => 0.87m, "BE" => 0.92m, _ => 1.00m }
         };
-        decimal multiplier = (store, country) switch
-        {
-            ("Aldi", _) or ("Aldi Süd", _) => 0.82m,
-            ("Lidl", _) => 0.85m,
-            (_, "DE") => 0.88m,
-            (_, "BE") => 0.92m,
-            ("Albert Heijn", _) => 1.10m,
-            _ => 1.00m
-        };
+
         return Math.Round(basePrice * multiplier, 2);
     }
 

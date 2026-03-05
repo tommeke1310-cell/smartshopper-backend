@@ -45,6 +45,17 @@ static void AddJumboResilience(IHttpClientBuilder b) =>
     });
 
 // ─── HTTP Clients per scraper MET Polly ───────────────────────────
+// Proxy support: stel per scraper in via Railway environment variabelen:
+//   PROXY_URL_AH=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_JUMBO=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_LIDL=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_ALDI=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_REWE=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_EDEKA=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_COLRUYT=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_DELHAIZE=http://user:pass@proxy.brightdata.com:22225
+//   PROXY_URL_DM=http://user:pass@proxy.brightdata.com:22225
+// Laat leeg = directe verbinding (huidig gedrag)
 AddScraperResilience(builder.Services.AddHttpClient<AlbertHeijnScraper>());
 AddJumboResilience(builder.Services.AddHttpClient<JumboScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<LidlScraper>());
