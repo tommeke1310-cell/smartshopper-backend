@@ -1,5 +1,7 @@
 using SmartShopper.API.Services;
 using SmartShopper.API.Services.Scrapers;
+using SmartShopper.API.Services.Routing;
+using Microsoft.Extensions.Http.Resilience;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,23 +15,35 @@ builder.Services.AddSwaggerGen(c =>
 builder.Services.AddCors(o => o.AddPolicy("AllowAll",
     p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
 
-// ─── HTTP Clients per scraper ─────────────────────────────────────
-builder.Services.AddHttpClient<AlbertHeijnScraper>(c => c.Timeout = TimeSpan.FromSeconds(8));
-builder.Services.AddHttpClient<JumboScraper>(      c => c.Timeout = TimeSpan.FromSeconds(8));
-builder.Services.AddHttpClient<LidlScraper>(       c => c.Timeout = TimeSpan.FromSeconds(8));
-builder.Services.AddHttpClient<AldiScraper>(       c => c.Timeout = TimeSpan.FromSeconds(8));
-builder.Services.AddHttpClient<DmScraper>(         c => c.Timeout = TimeSpan.FromSeconds(8));
-builder.Services.AddHttpClient<ReweScraper>(       c => c.Timeout = TimeSpan.FromSeconds(8));
-builder.Services.AddHttpClient<EdekaScraper>(      c => c.Timeout = TimeSpan.FromSeconds(8));
+// ─── Helpers voor Polly retry + circuit breaker ────────────────────
+static IHttpClientBuilder AddScraperResilience(IHttpClientBuilder b) =>
+    b.AddStandardResilienceHandler(o =>
+    {
+        o.Retry.MaxRetryAttempts = 3;
+        o.Retry.Delay = TimeSpan.FromSeconds(1);
+        o.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(2);
+        o.CircuitBreaker.FailureRatio = 0.5;
+        o.CircuitBreaker.MinimumThroughput = 5;
+        o.CircuitBreaker.BreakDuration = TimeSpan.FromMinutes(2);
+        o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(8);
+        o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(25);
+    });
 
-// ─── CompareService krijgt eigen HttpClient voor Google Places ────
-builder.Services.AddHttpClient<CompareService>(    c => c.Timeout = TimeSpan.FromSeconds(10));
+// ─── HTTP Clients per scraper MET Polly ───────────────────────────
+AddScraperResilience(builder.Services.AddHttpClient<AlbertHeijnScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<JumboScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<LidlScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<AldiScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<DmScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<ReweScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<EdekaScraper>());
 
-// ─── IntelligenceService ──────────────────────────────────────────
-builder.Services.AddHttpClient<IntelligenceService>(c => c.Timeout = TimeSpan.FromSeconds(8));
-
-// ─── SharedListService ────────────────────────────────────────────
-builder.Services.AddHttpClient<SharedListService>( c => c.Timeout = TimeSpan.FromSeconds(8));
+// ─── Business services ───────────────────────────────────────────
+builder.Services.AddHttpClient<CompareService>(c => c.Timeout = TimeSpan.FromSeconds(30));
+builder.Services.AddHttpClient<IntelligenceService>(c => c.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddHttpClient<SharedListService>(c => c.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddHttpClient<RoutingService>(c => c.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddHttpClient<ScraperHealthService>(c => c.Timeout = TimeSpan.FromSeconds(12));
 
 // ─── Scraper registraties (Scoped) ───────────────────────────────
 builder.Services.AddScoped<AlbertHeijnScraper>();
@@ -40,21 +54,23 @@ builder.Services.AddScoped<DmScraper>();
 builder.Services.AddScoped<ReweScraper>();
 builder.Services.AddScoped<EdekaScraper>();
 
-// ─── Business services ───────────────────────────────────────────
+// ─── Business services (Scoped) ──────────────────────────────────
 builder.Services.AddScoped<CompareService>();
 builder.Services.AddScoped<IntelligenceService>();
 builder.Services.AddScoped<SharedListService>();
+builder.Services.AddScoped<RoutingService>();
 
-// ─── Cache ───────────────────────────────────────────────────────
+// ─── Health service (Singleton — houdt status bij) ───────────────
+builder.Services.AddSingleton<ScraperHealthService>();
+
+// ─── Cache + Memory ──────────────────────────────────────────────
 builder.Services.AddMemoryCache();
 
 // ─── Logging ─────────────────────────────────────────────────────
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
-if (builder.Environment.IsProduction())
-    builder.Logging.SetMinimumLevel(LogLevel.Information);
-else
-    builder.Logging.SetMinimumLevel(LogLevel.Debug);
+builder.Logging.SetMinimumLevel(
+    builder.Environment.IsProduction() ? LogLevel.Information : LogLevel.Debug);
 
 var app = builder.Build();
 
@@ -65,21 +81,22 @@ app.UseCors("AllowAll");
 app.UseAuthorization();
 app.MapControllers();
 
-// Health / root endpoints
+// ─── Health endpoints ─────────────────────────────────────────────
 app.MapGet("/health", () => new
 {
-    status  = "ok",
-    time    = DateTime.UtcNow,
-    version = "2.0.0",
+    status = "ok",
+    time = DateTime.UtcNow,
+    version = "3.0.0",
 });
 
 app.MapGet("/", () => new
 {
-    message = "SmartShopper API draait!",
-    time    = DateTime.UtcNow,
+    message = "SmartShopper API v3 draait!",
+    time = DateTime.UtcNow,
     endpoints = new[]
     {
         "POST /api/compare",
+        "GET  /api/health/scrapers",
         "POST /api/behavior",
         "POST /api/purchase",
         "GET  /api/recommendations",
@@ -92,7 +109,11 @@ app.MapGet("/", () => new
     }
 });
 
+// ─── Start scraper health check op achtergrond ────────────────────
+var healthService = app.Services.GetRequiredService<ScraperHealthService>();
+_ = Task.Run(() => healthService.RunHealthChecksAsync());
+
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
-Console.WriteLine($"🛒 SmartShopper API v2.0 gestart op poort {port}");
+Console.WriteLine($"🛒 SmartShopper API v3.0 gestart op poort {port}");
 
 app.Run();

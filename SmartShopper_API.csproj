@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SmartShopper.API</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Polly: retry + circuit breaker voor scrapers -->
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="9.0.0" />
+
+    <!-- HTML parsing voor scraper fallbacks -->
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.61" />
+
+    <!-- Swagger -->
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.9.0" />
+  </ItemGroup>
+
+</Project>
