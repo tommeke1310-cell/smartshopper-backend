@@ -37,6 +37,8 @@ AddScraperResilience(builder.Services.AddHttpClient<AldiScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<DmScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<ReweScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<EdekaScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<ColruytScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<DelhaizeScraper>());
 
 // ─── Business services ───────────────────────────────────────────
 builder.Services.AddHttpClient<CompareService>(c => c.Timeout = TimeSpan.FromSeconds(30));
@@ -53,6 +55,8 @@ builder.Services.AddScoped<AldiScraper>();
 builder.Services.AddScoped<DmScraper>();
 builder.Services.AddScoped<ReweScraper>();
 builder.Services.AddScoped<EdekaScraper>();
+builder.Services.AddScoped<ColruytScraper>();
+builder.Services.AddScoped<DelhaizeScraper>();
 
 // ─── Business services (Scoped) ──────────────────────────────────
 builder.Services.AddScoped<CompareService>();
@@ -62,6 +66,9 @@ builder.Services.AddScoped<RoutingService>();
 
 // ─── Health service (Singleton — houdt status bij) ───────────────
 builder.Services.AddSingleton<ScraperHealthService>();
+
+// ─── Achtergrond scraper (elke 6 uur alle producten scrapen) ─────
+builder.Services.AddHostedService<BackgroundScraperService>();
 
 // ─── Cache + Memory ──────────────────────────────────────────────
 builder.Services.AddMemoryCache();
