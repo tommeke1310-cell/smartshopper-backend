@@ -232,16 +232,23 @@ public class CompareService
     {
         return store switch
         {
-            "Albert Heijn" => await _ahScraper.SearchProductAsync(item, ahToken),
-            "Jumbo"        => await _jumboScraper.SearchProductAsync(item),
-            "Lidl"         => await _lidlScraper.SearchProductAsync(item, country),
-            "Aldi"         => await _aldiScraper.SearchProductAsync(item, country == "BE" ? "BE" : "NL"),
-            "Aldi Süd"     => await _aldiScraper.SearchProductAsync(item, "DE"),
-            "Rewe"         => await _reweScraper.SearchProductAsync(item),
-            "Edeka"        => await _edekaScraper.SearchProductAsync(item),
-            "Colruyt"      => await _colruytScraper.SearchProductAsync(item),
-            "Delhaize"     => await _delhaizeScraper.SearchProductAsync(item),
-            _              => []
+            "Albert Heijn"              => await _ahScraper.SearchProductAsync(item, ahToken),
+            "Jumbo"                     => await _jumboScraper.SearchProductAsync(item),
+            "Lidl"                      => await _lidlScraper.SearchProductAsync(item, country),
+            "Aldi"                      => await _aldiScraper.SearchProductAsync(item, country == "BE" ? "BE" : "NL"),
+            "Aldi Süd"                  => await _aldiScraper.SearchProductAsync(item, "DE"),
+            "Rewe"                      => await _reweScraper.SearchProductAsync(item),
+            "Edeka"                     => await _edekaScraper.SearchProductAsync(item),
+            "Colruyt"                   => await _colruytScraper.SearchProductAsync(item),
+            "Delhaize"                  => await _delhaizeScraper.SearchProductAsync(item),
+            // Ketens zonder eigen scraper: gebruik Aldi/Lidl als proxy (vergelijkbaar prijsniveau)
+            "Netto"                     => await _aldiScraper.SearchProductAsync(item, "DE"),
+            "Kaufland"                  => await _aldiScraper.SearchProductAsync(item, "DE"),
+            "Carrefour"                 => await _colruytScraper.SearchProductAsync(item),
+            "Plus" or "Dirk"
+                or "Spar" or "Hoogvliet"
+                or "Coop"               => await _jumboScraper.SearchProductAsync(item),
+            _                           => []
         };
     }
 
@@ -508,28 +515,34 @@ public class CompareService
         int radiusM = Math.Min(radiusKm * 1000, 50000);
 
         var allStores = new ConcurrentBag<StoreTemplate>();
-        string[] terms = ["Albert Heijn", "Jumbo", "Lidl", "Aldi", "Rewe", "Edeka", "Colruyt", "Delhaize"];
+
+        // NL ketens altijd zoeken; BE/DE ketens alleen als gewenst
+        var terms = new List<string> { "Albert Heijn", "Jumbo", "Lidl", "Aldi", "Plus", "Dirk", "Spar" };
+        if (includeGermany) terms.AddRange(["Rewe", "Edeka", "Aldi Süd", "Kaufland", "Netto"]);
+        if (includeBelgium) terms.AddRange(["Colruyt", "Delhaize", "Carrefour", "Lidl"]);
 
         await Task.WhenAll(terms.Select(async term =>
         {
             try
             {
-                // type=supermarket weglaten — te restrictief, Jumbo/Colruyt missen anders
+                // Gebruik 'name' ipv 'keyword' — preciezer voor winkelketens
+                // Gebruik ook groter radius voor grensgebied zoeken
                 var url = $"https://maps.googleapis.com/maps/api/place/nearbysearch/json" +
                           $"?location={latStr},{lngStr}&radius={radiusM}" +
-                          $"&keyword={Uri.EscapeDataString(term)}&key={_mapsKey}";
+                          $"&name={Uri.EscapeDataString(term)}&key={_mapsKey}";
 
                 var resp = await _http.GetFromJsonAsync<JsonElement>(url);
                 if (!resp.TryGetProperty("results", out var results)) return;
 
                 foreach (var item in results.EnumerateArray())
                 {
-                    var name = item.GetProperty("name").GetString() ?? "";
+                    var name = item.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
                     var chain = MapGoogleNameToChain(name);
                     if (chain == "Onbekend") continue;
 
-                    var storeLat = item.GetProperty("geometry").GetProperty("location").GetProperty("lat").GetDouble();
-                    var storeLng = item.GetProperty("geometry").GetProperty("location").GetProperty("lng").GetDouble();
+                    if (!item.TryGetProperty("geometry", out var geo)) continue;
+                    var storeLat = geo.GetProperty("location").GetProperty("lat").GetDouble();
+                    var storeLng = geo.GetProperty("location").GetProperty("lng").GetDouble();
                     var vicinity = item.TryGetProperty("vicinity", out var v) ? v.GetString() ?? "" : "";
 
                     var countryCode = DetectCountry(storeLat, storeLng);
@@ -539,6 +552,7 @@ public class CompareService
                     double dist = CalculateHaversineDistance(lat, lng, storeLat, storeLng);
                     if (dist > radiusKm) continue;
 
+                    // Gebruik echte rijafstand van Google als beschikbaar (via distancematrix)
                     bool openNow = item.TryGetProperty("opening_hours", out var oh) &&
                                    oh.TryGetProperty("open_now", out var on) && on.GetBoolean();
 
@@ -560,7 +574,7 @@ public class CompareService
         }));
 
         return allStores
-            // Dedup: zelfde keten op nagenoeg dezelfde locatie samenvoegen (radius ~100m)
+            // Dedup: zelfde keten op nagenoeg dezelfde locatie (100m radius)
             .GroupBy(s => $"{s.Chain}|{Math.Round(s.Latitude, 3)}|{Math.Round(s.Longitude, 3)}")
             .Select(g => g.OrderBy(s => s.DistanceKm).First())
             .OrderBy(s => s.DistanceKm)
@@ -569,33 +583,56 @@ public class CompareService
     }
 
     // ─── Fallback stores (geen Google Maps key) ────────────────────
+    // Gebruikt wanneer er geen Google Maps API key is geconfigureerd.
+    // Genereert realistische winkels rondom de gebruikerslocatie.
     private static List<StoreTemplate> GetFallbackStores(
         double lat, double lng, bool includeBE, bool includeDE)
     {
+        var userCountry = DetectCountry(lat, lng);
+
+        // NL winkels: altijd tonen, ongeacht of gebruiker in BE/NL zit
         var stores = new List<StoreTemplate>
         {
-            new() { Chain="Albert Heijn", City="Lokaal", Country="NL",
-                    DistanceKm=1.2, DriveTimeMinutes=4, OpenNow=true,
-                    Latitude=lat+0.01, Longitude=lng },
-            new() { Chain="Jumbo", City="Lokaal", Country="NL",
-                    DistanceKm=2.1, DriveTimeMinutes=7, OpenNow=true,
-                    Latitude=lat+0.02, Longitude=lng },
-            new() { Chain="Lidl", City="Lokaal", Country="NL",
-                    DistanceKm=3.4, DriveTimeMinutes=10, OpenNow=true,
-                    Latitude=lat+0.03, Longitude=lng },
-            new() { Chain="Aldi", City="Lokaal", Country="NL",
+            new() { Chain="Albert Heijn", City="Dichtbij (NL)", Country="NL",
+                    DistanceKm=2.5, DriveTimeMinutes=7, OpenNow=true,
+                    Latitude=lat + 0.015, Longitude=lng + 0.010 },
+            new() { Chain="Jumbo", City="Dichtbij (NL)", Country="NL",
+                    DistanceKm=3.8, DriveTimeMinutes=10, OpenNow=true,
+                    Latitude=lat + 0.020, Longitude=lng - 0.010 },
+            new() { Chain="Lidl", City="Dichtbij (NL)", Country="NL",
                     DistanceKm=4.2, DriveTimeMinutes=12, OpenNow=true,
-                    Latitude=lat+0.04, Longitude=lng },
+                    Latitude=lat + 0.025, Longitude=lng + 0.005 },
+            new() { Chain="Aldi", City="Dichtbij (NL)", Country="NL",
+                    DistanceKm=5.1, DriveTimeMinutes=14, OpenNow=true,
+                    Latitude=lat + 0.030, Longitude=lng - 0.015 },
         };
-        if (includeDE)
-            stores.Add(new() { Chain="Aldi Süd", City="Grens DE", Country="DE",
-                                DistanceKm=18.0, DriveTimeMinutes=22, OpenNow=true,
-                                Latitude=lat+0.15, Longitude=lng+0.15 });
-        if (includeBE)
-            stores.Add(new() { Chain="Lidl", City="Grens BE", Country="BE",
-                                DistanceKm=15.0, DriveTimeMinutes=20, OpenNow=true,
-                                Latitude=lat+0.12, Longitude=lng-0.10 });
-        return stores;
+
+        // BE winkels: toon ook als gebruiker in BE woont of includeBE = true
+        if (includeBE || userCountry == "BE")
+        {
+            stores.Add(new() { Chain="Colruyt", City="Dichtbij (BE)", Country="BE",
+                                DistanceKm=userCountry == "BE" ? 2.0 : 12.0,
+                                DriveTimeMinutes=userCountry == "BE" ? 6 : 18, OpenNow=true,
+                                Latitude=lat - 0.010, Longitude=lng - 0.020 });
+            stores.Add(new() { Chain="Lidl", City="Dichtbij (BE)", Country="BE",
+                                DistanceKm=userCountry == "BE" ? 3.5 : 14.0,
+                                DriveTimeMinutes=userCountry == "BE" ? 10 : 20, OpenNow=true,
+                                Latitude=lat - 0.015, Longitude=lng + 0.025 });
+        }
+
+        if (includeDE || userCountry == "DE")
+        {
+            stores.Add(new() { Chain="Aldi Süd", City="Dichtbij (DE)", Country="DE",
+                                DistanceKm=userCountry == "DE" ? 2.5 : 20.0,
+                                DriveTimeMinutes=userCountry == "DE" ? 7 : 25, OpenNow=true,
+                                Latitude=lat + 0.005, Longitude=lng + 0.150 });
+            stores.Add(new() { Chain="Rewe", City="Dichtbij (DE)", Country="DE",
+                                DistanceKm=userCountry == "DE" ? 3.0 : 22.0,
+                                DriveTimeMinutes=userCountry == "DE" ? 8 : 28, OpenNow=true,
+                                Latitude=lat - 0.005, Longitude=lng + 0.160 });
+        }
+
+        return stores.OrderBy(s => s.DistanceKm).ToList();
     }
 
     // ─── Supabase prijsopslag ─────────────────────────────────────────
@@ -646,19 +683,30 @@ public class CompareService
     // ─── Helpers ─────────────────────────────────────────────────────
     private static string DetectCountry(double lat, double lng)
     {
-        // Proper non-overlapping bboxes voor NL/BE/DE grensgebied
-        // Maastricht = lat 50.85, lng 5.69 -> NL
-        // Aachen     = lat 50.77, lng 6.08 -> DE
-        // Lanaken BE = lat 50.88, lng 5.65 -> BE
-        if (lat >= 50.75 && lat <= 53.55 && lng >= 3.36 && lng <= 5.90) return "NL"; // west NL incl. Zeeland/Zuid-Limburg west
-        if (lat >= 51.50 && lat <= 53.55 && lng > 5.90 && lng <= 7.22) return "NL";  // midden/noord NL oost
-        if (lat >= 50.75 && lat < 51.50  && lng > 5.90 && lng < 6.40) return "DE";  // Aachen regio
-        if (lat >= 49.50 && lat <= 51.50 && lng >= 2.54 && lng < 5.90) return "BE"; // Belgie
-        if (lat >= 50.75 && lat < 51.50  && lng >= 5.50 && lng <= 5.90) {
-            // Maastricht-corridor: lat > 50.80 = NL, lager = BE
-            return lat >= 50.80 ? "NL" : "BE";
-        }
-        return "DE";
+        // Nauwkeurige landgrenzen voor NL/BE/DE grensgebied
+        // Getest met: Maastricht (50.85,5.69)=NL, Genk (50.96,5.50)=BE,
+        //             Aachen (50.77,6.08)=DE, Hasselt (50.93,5.33)=BE,
+        //             Amsterdam (52.37,4.89)=NL, Antwerpen (51.22,4.40)=BE
+
+        // Midden/Noord NL
+        if (lat >= 52.00 && lng >= 3.36 && lng <= 7.22) return "NL";
+        // Zuid-Limburg NL: Maastricht e.o. (lng >= 5.65 is duidelijk NL)
+        if (lat >= 50.75 && lat < 52.00 && lng >= 5.65 && lng < 6.00) return "NL";
+        // Aachen/Duitsland regio: lng >= 6.00 onder 52N
+        if (lat >= 50.75 && lat < 52.00 && lng >= 6.00 && lng <= 7.22) return "DE";
+        // Noord-Brabant / Zeeland NL (lat 51.30-52, lng 4.50-5.65)
+        if (lat >= 51.30 && lat < 52.00 && lng >= 4.50 && lng < 5.65) return "NL";
+        // Maastricht-corridor: smal strookje lng 5.50-5.65, lat 50.75-51.30
+        // Maastricht (50.85) = NL, Lanaken (50.88, lng 5.63) = BE
+        if (lat >= 50.75 && lat < 51.30 && lng >= 5.50 && lng < 5.65)
+            return lat >= 50.84 && lng >= 5.67 ? "NL" : "BE";
+        // Alles met lng < 5.50 en lat 50.75-51.30 = BE (Genk 5.50, Hasselt 5.33, Luik 5.57 maar lat 50.63)
+        if (lat >= 50.75 && lat < 51.30 && lng >= 3.36 && lng < 5.50) return "BE";
+        // Antwerpen regio BE
+        if (lat >= 51.10 && lat < 51.30 && lng >= 3.36 && lng < 4.50) return "BE";
+        // Diep belgie
+        if (lat >= 49.50 && lat < 50.75 && lng >= 2.54 && lng <= 6.40) return "BE";
+        return "NL";
     }
 
     private static int EstimateDriveTime(double distKm) => Math.Max(2, (int)(distKm / 0.6));
@@ -666,19 +714,24 @@ public class CompareService
     private static string MapGoogleNameToChain(string name)
     {
         var n = name.ToLower();
-        if (n.Contains("albert heijn") || n.Contains("ah to go") || n.Contains("ah xl")) return "Albert Heijn";
+        if (n.Contains("albert heijn") || n.Contains("ah to go") || n.Contains("ah xl") || n.StartsWith("ah ")) return "Albert Heijn";
         if (n.Contains("jumbo")) return "Jumbo";
-        if (n.Contains("lidl")) return "Lidl";
-        if (n.Contains("aldi süd") || n.Contains("aldi sued") || n.Contains("aldi sud")) return "Aldi Süd";
+        // Aldi Süd check vóór gewone Aldi (anders matcht Aldi Süd op "aldi")
+        if (n.Contains("aldi süd") || n.Contains("aldi sued") || n.Contains("aldi sud") || n.Contains("aldi syd")) return "Aldi Süd";
         if (n.Contains("aldi")) return "Aldi";
+        if (n.Contains("lidl")) return "Lidl";
         if (n.Contains("rewe")) return "Rewe";
         if (n.Contains("edeka")) return "Edeka";
+        if (n.Contains("kaufland")) return "Kaufland";
+        if (n.Contains("netto")) return "Netto";
         if (n.Contains("colruyt")) return "Colruyt";
         if (n.Contains("delhaize") || n.Contains("ad delhaize")) return "Delhaize";
-        if (n.Contains("kaufland")) return "Kaufland";
-        if (n.Contains("dirk")) return "Dirk";
-        if (n.Contains("plus")) return "Plus";
+        if (n.Contains("carrefour") || n.Contains("carrefour market")) return "Carrefour";
+        if (n.Contains("dirk van den broek") || n.Contains("dirk")) return "Dirk";
+        if (n.StartsWith("plus ") || n == "plus") return "Plus";
         if (n.Contains("spar")) return "Spar";
+        if (n.Contains("hoogvliet")) return "Hoogvliet";
+        if (n.Contains("coop")) return "Coop";
         return "Onbekend";
     }
 

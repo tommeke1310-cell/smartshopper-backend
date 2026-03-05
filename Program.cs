@@ -88,6 +88,7 @@ builder.Services.AddSingleton<ScraperHealthService>();
 // Let op: BackgroundScraperService gebruikt zijn eigen HttpClients
 // en heeft geen afhankelijkheid op de Scoped scrapers hierboven.
 builder.Services.AddHostedService<BackgroundScraperService>();
+builder.Services.AddHttpClient<BackgroundScraperService>(c => c.Timeout = TimeSpan.FromSeconds(30));
 
 // ─── Cache + Memory ──────────────────────────────────────────────
 builder.Services.AddMemoryCache();

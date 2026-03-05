@@ -452,7 +452,7 @@ public class ReweScraper
                 _logger.LogInformation("REWE DE: {Product} → €{Price}", name, price);
                 return [new ProductMatch
                 {
-                    StoreName = "REWE", Country = "DE", ProductName = name, Price = price,
+                    StoreName = "Rewe", Country = "DE", ProductName = name, Price = price,
                     IsEstimated = false, IsBiologisch = isBio,
                     MatchConfidence = WordScore(item.Name, name)
                 }];
@@ -495,7 +495,7 @@ public class ReweScraper
                 if (m.Success && decimal.TryParse(m.Value, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p) && p > 0)
                     return [new ProductMatch
                     {
-                        StoreName = "REWE", Country = "DE", ProductName = item.Name,
+                        StoreName = "Rewe", Country = "DE", ProductName = item.Name,
                         Price = p, IsEstimated = false, MatchConfidence = 0.7
                     }];
             }
