@@ -225,7 +225,7 @@ public class CompareService
             "Albert Heijn" => await _ahScraper.SearchProductAsync(item, ahToken),
             "Jumbo"        => await _jumboScraper.SearchProductAsync(item),
             "Lidl"         => await _lidlScraper.SearchProductAsync(item, country),
-            "Aldi"         => await _aldiScraper.SearchProductAsync(item, "NL"),
+            "Aldi"         => await _aldiScraper.SearchProductAsync(item, country == "BE" ? "BE" : "NL"),
             "Aldi Süd"     => await _aldiScraper.SearchProductAsync(item, "DE"),
             "Rewe"         => await _reweScraper.SearchProductAsync(item),
             "Edeka"        => await _edekaScraper.SearchProductAsync(item),
@@ -550,7 +550,8 @@ public class CompareService
         }));
 
         return allStores
-            .GroupBy(s => $"{Math.Round(s.Latitude, 3)}|{Math.Round(s.Longitude, 3)}")
+            // Dedup: zelfde keten op nagenoeg dezelfde locatie samenvoegen (radius ~100m)
+            .GroupBy(s => $"{s.Chain}|{Math.Round(s.Latitude, 3)}|{Math.Round(s.Longitude, 3)}")
             .Select(g => g.OrderBy(s => s.DistanceKm).First())
             .OrderBy(s => s.DistanceKm)
             .Take(20)
@@ -635,8 +636,18 @@ public class CompareService
     // ─── Helpers ─────────────────────────────────────────────────────
     private static string DetectCountry(double lat, double lng)
     {
-        if (lat >= 50.75 && lat <= 53.55 && lng >= 3.36 && lng <= 7.23) return "NL";
-        if (lat >= 49.50 && lat <= 51.50 && lng >= 2.54 && lng <= 6.41) return "BE";
+        // Proper non-overlapping bboxes voor NL/BE/DE grensgebied
+        // Maastricht = lat 50.85, lng 5.69 -> NL
+        // Aachen     = lat 50.77, lng 6.08 -> DE
+        // Lanaken BE = lat 50.88, lng 5.65 -> BE
+        if (lat >= 50.75 && lat <= 53.55 && lng >= 3.36 && lng <= 5.90) return "NL"; // west NL incl. Zeeland/Zuid-Limburg west
+        if (lat >= 51.50 && lat <= 53.55 && lng > 5.90 && lng <= 7.22) return "NL";  // midden/noord NL oost
+        if (lat >= 50.75 && lat < 51.50  && lng > 5.90 && lng < 6.40) return "DE";  // Aachen regio
+        if (lat >= 49.50 && lat <= 51.50 && lng >= 2.54 && lng < 5.90) return "BE"; // Belgie
+        if (lat >= 50.75 && lat < 51.50  && lng >= 5.50 && lng <= 5.90) {
+            // Maastricht-corridor: lat > 50.80 = NL, lager = BE
+            return lat >= 50.80 ? "NL" : "BE";
+        }
         return "DE";
     }
 
