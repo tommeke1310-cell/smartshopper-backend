@@ -5,6 +5,35 @@ using Microsoft.Extensions.Http.Resilience;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// ─── Railway environment variabelen direct injecteren ────────────
+// ASP.NET Core leest Railway env vars via GoogleMaps__ApiKey notatie
+// maar Railway gebruikt GOOGLE_MAPS_API_KEY — we mappen ze hier expliciet
+var googleMapsKey = Environment.GetEnvironmentVariable("GOOGLE_MAPS_API_KEY")
+                 ?? Environment.GetEnvironmentVariable("GoogleMaps__ApiKey")
+                 ?? builder.Configuration["GoogleMaps:ApiKey"]
+                 ?? "";
+
+var supabaseAnonKey = Environment.GetEnvironmentVariable("SUPABASE_ANON_KEY")
+                   ?? Environment.GetEnvironmentVariable("Supabase__AnonKey")
+                   ?? builder.Configuration["Supabase:AnonKey"]
+                   ?? "";
+
+var supabaseServiceKey = Environment.GetEnvironmentVariable("SUPABASE_SERVICE_KEY")
+                      ?? Environment.GetEnvironmentVariable("Supabase__ServiceKey")
+                      ?? builder.Configuration["Supabase:ServiceKey"]
+                      ?? "";
+
+// Injecteer als in-memory config zodat alle services ze kunnen lezen
+builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+{
+    ["GoogleMaps:ApiKey"]  = googleMapsKey,
+    ["Supabase:AnonKey"]   = supabaseAnonKey,
+    ["Supabase:ServiceKey"] = supabaseServiceKey,
+});
+
+Console.WriteLine($"🗺️  Google Maps key geladen: {(string.IsNullOrEmpty(googleMapsKey) ? "❌ NIET GEVONDEN" : $"✅ ({googleMapsKey[..Math.Min(8, googleMapsKey.Length)]}...)")}");
+Console.WriteLine($"🗄️  Supabase key geladen: {(string.IsNullOrEmpty(supabaseAnonKey) ? "❌ NIET GEVONDEN" : "✅")}");
+
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
@@ -29,13 +58,11 @@ static void AddScraperResilience(IHttpClientBuilder b) =>
         o.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(25);
     });
 
-// Jumbo krijgt eigen resilience: geen retry op 403, kortere timeout
 static void AddJumboResilience(IHttpClientBuilder b) =>
     b.AddStandardResilienceHandler(o =>
     {
         o.Retry.MaxRetryAttempts = 1;
         o.Retry.Delay = TimeSpan.FromSeconds(1);
-        // Geen circuit breaker voor Jumbo — liever fallback dan open circuit
         o.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(5);
         o.CircuitBreaker.FailureRatio = 0.9;
         o.CircuitBreaker.MinimumThroughput = 20;
@@ -45,17 +72,6 @@ static void AddJumboResilience(IHttpClientBuilder b) =>
     });
 
 // ─── HTTP Clients per scraper MET Polly ───────────────────────────
-// Proxy support: stel per scraper in via Railway environment variabelen:
-//   PROXY_URL_AH=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_JUMBO=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_LIDL=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_ALDI=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_REWE=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_EDEKA=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_COLRUYT=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_DELHAIZE=http://user:pass@proxy.brightdata.com:22225
-//   PROXY_URL_DM=http://user:pass@proxy.brightdata.com:22225
-// Laat leeg = directe verbinding (huidig gedrag)
 AddScraperResilience(builder.Services.AddHttpClient<AlbertHeijnScraper>());
 AddJumboResilience(builder.Services.AddHttpClient<JumboScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<LidlScraper>());
@@ -92,12 +108,10 @@ builder.Services.AddScoped<SharedListService>();
 builder.Services.AddScoped<RoutingService>();
 builder.Services.AddScoped<ConsentService>();
 
-// ─── Health service (Singleton — houdt status bij) ───────────────
+// ─── Health service (Singleton) ──────────────────────────────────
 builder.Services.AddSingleton<ScraperHealthService>();
 
-// ─── Achtergrond scraper (elke 6 uur alle producten scrapen) ─────
-// Let op: BackgroundScraperService gebruikt zijn eigen HttpClients
-// en heeft geen afhankelijkheid op de Scoped scrapers hierboven.
+// ─── Achtergrond scraper ─────────────────────────────────────────
 builder.Services.AddHostedService<BackgroundScraperService>();
 builder.Services.AddHttpClient<BackgroundScraperService>(c => c.Timeout = TimeSpan.FromSeconds(30));
 
@@ -119,17 +133,17 @@ app.UseCors("AllowAll");
 app.UseAuthorization();
 app.MapControllers();
 
-// ─── Health endpoints ─────────────────────────────────────────────
 app.MapGet("/health", () => new
 {
     status = "ok",
     time = DateTime.UtcNow,
-    version = "3.0.0",
+    version = "3.1.0",
+    googleMaps = !string.IsNullOrEmpty(googleMapsKey) ? "configured" : "missing",
 });
 
 app.MapGet("/", () => new
 {
-    message = "SmartShopper API v3 draait!",
+    message = "SmartShopper API v3.1 draait!",
     time = DateTime.UtcNow,
     endpoints = new[]
     {
@@ -147,13 +161,10 @@ app.MapGet("/", () => new
     }
 });
 
-// ─── Start scraper health check op achtergrond ────────────────────
 var healthService = app.Services.GetRequiredService<ScraperHealthService>();
 _ = Task.Run(() => healthService.RunHealthChecksAsync());
 
-// Railway injecteert PORT als env variabele (standaard 8080)
-// Expliciet binden zodat de healthcheck /health bereikbaar is
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
-Console.WriteLine($"🛒 SmartShopper API v3.0 gestart op poort {port}");
+Console.WriteLine($"🛒 SmartShopper API v3.1 gestart op poort {port}");
 
 app.Run($"http://0.0.0.0:{port}");

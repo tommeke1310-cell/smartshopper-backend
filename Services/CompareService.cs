@@ -50,9 +50,19 @@ public class CompareService
         _colruytScraper = colruyt;
         _delhaizeScraper = delhaize;
 
-        _supabaseUrl = config["Supabase:Url"] ?? "";
-        _supabaseKey = config["Supabase:ServiceKey"] ?? config["Supabase:AnonKey"] ?? "";
-        _mapsKey = config["GoogleMaps:ApiKey"];
+        _supabaseUrl = Environment.GetEnvironmentVariable("SUPABASE_URL")
+                       ?? config["Supabase:Url"] ?? "";
+        _supabaseKey = Environment.GetEnvironmentVariable("SUPABASE_SERVICE_KEY")
+                       ?? Environment.GetEnvironmentVariable("SUPABASE_ANON_KEY")
+                       ?? config["Supabase:ServiceKey"]
+                       ?? config["Supabase:AnonKey"] ?? "";
+
+        // Railway injecteert env vars — ASP.NET Core leest deze via dubbele underscore
+        // of direct via Environment.GetEnvironmentVariable.
+        // Volgorde: 1) env var GOOGLE_MAPS_API_KEY  2) config sectie  3) leeg
+        _mapsKey = Environment.GetEnvironmentVariable("GOOGLE_MAPS_API_KEY")
+                   ?? Environment.GetEnvironmentVariable("GoogleMaps__ApiKey")
+                   ?? config["GoogleMaps:ApiKey"];
     }
 
     public async Task<CompareResult> ComparePricesAsync(CompareRequest request)
@@ -61,7 +71,10 @@ public class CompareService
 
         // ─── 1. Winkels ophalen ──────────────────────────────────────
         List<StoreTemplate> nearbyStores;
-        bool hasMapsKey = !string.IsNullOrEmpty(_mapsKey) && !_mapsKey.StartsWith("ZET_HIER");
+        bool hasMapsKey = !string.IsNullOrWhiteSpace(_mapsKey)
+                          && !_mapsKey.StartsWith("ZET_HIER")
+                          && !_mapsKey.StartsWith("${")
+                          && _mapsKey.Length > 10;
 
         if (hasMapsKey)
         {
@@ -434,6 +447,10 @@ public class CompareService
     // ─── Open Food Facts fallback schatting ──────────────────────────
     private async Task<ProductMatch> EstimateViaOFF(GroceryItem item, string store, string country)
     {
+        // Probeer eerst een slimme schatting op naam — dit is sneller en betrouwbaarder
+        // dan wachten op OFF als de categorie toch leeg terugkomt
+        decimal directEstimate = EstimatePriceByName(item.Name, store, country);
+
         try
         {
             string lang = country == "DE" ? "de" : "nl";
@@ -441,7 +458,7 @@ public class CompareService
                       $"?search_terms={Uri.EscapeDataString(item.Name)}&search_simple=1" +
                       $"&action=process&json=1&page_size=3&lc={lang}&cc={country.ToLower()}";
 
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
             client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "SmartShopper/3.0");
             var json = await client.GetStringAsync(url);
             using var doc = JsonDocument.Parse(json);
@@ -461,18 +478,16 @@ public class CompareService
                     bool isVegan = p.TryGetProperty("labels_tags", out var lbt) &&
                                    lbt.EnumerateArray().Any(l => l.GetString()?.Contains("vegan") == true);
 
-                    // Zoek meest specifieke categorie (langste tag = meest specifiek)
-                    string category = "";
-                    if (p.TryGetProperty("categories_tags", out var cats))
-                    {
-                        category = cats.EnumerateArray()
-                            .Select(c => c.GetString() ?? "")
-                            .Where(c => c.StartsWith("en:") || c.StartsWith("nl:"))
-                            .OrderByDescending(c => c.Length)
-                            .FirstOrDefault() ?? cats.EnumerateArray().FirstOrDefault().GetString() ?? "";
-                    }
-
-                    decimal price = EstimatePriceFromCategory(category, store, country);
+                    // Gebruik naam-gebaseerde schatting — betrouwbaarder dan lege categorie
+                    decimal price = directEstimate > 0 ? directEstimate
+                                  : EstimatePriceFromCategory(
+                                        p.TryGetProperty("categories_tags", out var cats)
+                                            ? cats.EnumerateArray()
+                                                  .Select(c => c.GetString() ?? "")
+                                                  .OrderByDescending(c => c.Length)
+                                                  .FirstOrDefault() ?? ""
+                                            : "",
+                                        store, country);
 
                     return new ProductMatch
                     {
@@ -485,12 +500,161 @@ public class CompareService
         }
         catch (Exception ex) { _logger.LogDebug(ex, "OFF fallback fout voor {Product}", item.Name); }
 
+        // Altijd terugvallen op naam-gebaseerde schatting
         return new ProductMatch
         {
             StoreName = store, Country = country, ProductName = item.Name,
-            Price = EstimatePriceFromCategory("", store, country),
-            IsEstimated = true, MatchConfidence = 0.3
+            Price = directEstimate > 0 ? directEstimate : EstimatePriceFromCategory("", store, country),
+            IsEstimated = true, MatchConfidence = 0.4
         };
+    }
+
+    // ─── Slimme prijsschatting op productnaam ─────────────────────────
+    // Kijkt naar trefwoorden in de naam — werkt ook als OFF geen categorie teruggeeft
+    private static decimal EstimatePriceByName(string productName, string store, string country)
+    {
+        var n = productName.ToLower();
+
+        decimal basePrice =
+            // ── Frisdrank ────────────────────────────────────────────────
+            (n.Contains("coca-cola") || n.Contains("coca cola"))       ? 1.99m :
+            n.Contains("pepsi")                                         ? 1.89m :
+            n.Contains("fanta") || n.Contains("sprite")                ? 1.79m :
+            n.Contains("energy drink") || n.Contains("red bull")
+                || n.Contains("monster")                                ? 2.09m :
+            n.Contains("vruchtensap") || n.Contains("sinaasappelsap")
+                || n.Contains("appelsap")                               ? 1.79m :
+            n.Contains("spa") && n.Contains("water")                   ? 0.79m :
+            (n.Contains("water") && !n.Contains("was"))                ? 0.69m :
+            n.Contains("bier") || n.Contains("beer")                   ? 1.29m :
+            n.Contains("wijn") || n.Contains("wine")                   ? 6.99m :
+            n.Contains("frisdrank") || n.Contains("cola")              ? 1.79m :
+            n.Contains("sap") || n.Contains("juice")                   ? 1.79m :
+            // ── Koffie & thee ─────────────────────────────────────────────
+            n.Contains("nespresso") || n.Contains("dolce gusto")       ? 5.99m :
+            n.Contains("koffie") || n.Contains("coffee")               ? 4.49m :
+            n.Contains("thee") || n.Contains("tea")                    ? 2.49m :
+            // ── Zuivel ────────────────────────────────────────────────────
+            n.Contains("halfvolle melk") || n.Contains("volle melk")   ? 1.19m :
+            n.Contains("melk")                                          ? 1.09m :
+            n.Contains("yoghurt") || n.Contains("yogurt")              ? 1.49m :
+            n.Contains("kwark")                                         ? 1.79m :
+            n.Contains("gouda") || n.Contains("edammer")               ? 3.49m :
+            n.Contains("kaas") || n.Contains("cheese")                 ? 3.29m :
+            n.Contains("roomboter") || n.Contains("butter")            ? 2.69m :
+            n.Contains("margarine") || n.Contains("halvarine")         ? 1.89m :
+            n.Contains("slagroom") || n.Contains("kookroom")           ? 1.49m :
+            n.Contains("eieren") || n.Contains("ei ")                  ? 2.49m :
+            // ── Brood & bakkerij ──────────────────────────────────────────
+            n.Contains("volkoren") && n.Contains("brood")              ? 2.79m :
+            n.Contains("witbrood") || n.Contains("brood")              ? 2.49m :
+            n.Contains("croissant") || n.Contains("pistolet")          ? 1.99m :
+            n.Contains("beschuit")                                      ? 2.19m :
+            n.Contains("crackers") || n.Contains("cracker")            ? 2.29m :
+            n.Contains("koekjes") || n.Contains("koek")                ? 1.99m :
+            n.Contains("cake") || n.Contains("gebak")                  ? 2.99m :
+            // ── Vlees ─────────────────────────────────────────────────────
+            n.Contains("kipfilet") || n.Contains("kippenborst")        ? 5.49m :
+            n.Contains("kip") && n.Contains("gehakt")                  ? 3.99m :
+            n.Contains("gehakt") && n.Contains("rund")                 ? 5.99m :
+            n.Contains("gehakt")                                        ? 4.49m :
+            n.Contains("kipdrumsticks") || n.Contains("kippendij")     ? 4.29m :
+            n.Contains("kip")                                           ? 4.49m :
+            n.Contains("spek") || n.Contains("bacon")                  ? 3.29m :
+            n.Contains("ham")                                           ? 2.99m :
+            n.Contains("salami") || n.Contains("worst")                ? 2.79m :
+            n.Contains("vlees") || n.Contains("meat")                  ? 4.99m :
+            // ── Vis ───────────────────────────────────────────────────────
+            n.Contains("zalm") || n.Contains("salmon")                 ? 5.99m :
+            n.Contains("tonijn") || n.Contains("tuna")                 ? 1.99m :
+            n.Contains("garnalen") || n.Contains("shrimp")             ? 4.99m :
+            n.Contains("vis") || n.Contains("fish")                    ? 4.49m :
+            // ── Groente & fruit ───────────────────────────────────────────
+            n.Contains("tomaten") || n.Contains("tomaat")              ? 1.99m :
+            n.Contains("komkommer")                                     ? 1.09m :
+            n.Contains("sla") || n.Contains("salade")                  ? 1.49m :
+            n.Contains("paprika")                                       ? 1.79m :
+            n.Contains("uien") || n.Contains("ui ")                    ? 1.29m :
+            n.Contains("aardappelen") || n.Contains("aardappel")       ? 2.49m :
+            n.Contains("bananen") || n.Contains("banaan")              ? 1.79m :
+            n.Contains("appels") || n.Contains("appel")                ? 2.29m :
+            n.Contains("sinaasappel") || n.Contains("mandarijn")       ? 2.49m :
+            n.Contains("groente") || n.Contains("groenten")            ? 1.79m :
+            n.Contains("fruit")                                         ? 2.29m :
+            // ── Diepvries ─────────────────────────────────────────────────
+            n.Contains("pizza")                                         ? 3.49m :
+            n.Contains("diepvries") || n.Contains("frozen")            ? 3.29m :
+            // ── Droogwaren ────────────────────────────────────────────────
+            n.Contains("spaghetti") || n.Contains("penne")
+                || n.Contains("pasta")                                  ? 1.59m :
+            n.Contains("rijst") || n.Contains("rice")                  ? 1.99m :
+            n.Contains("cornflakes") || n.Contains("muesli")
+                || n.Contains("havermout")                              ? 3.49m :
+            n.Contains("soep") || n.Contains("soup")                   ? 1.99m :
+            n.Contains("tomatensaus") || n.Contains("pastasaus")       ? 2.29m :
+            n.Contains("mayonaise") || n.Contains("mayo")              ? 2.49m :
+            n.Contains("ketchup")                                       ? 2.29m :
+            n.Contains("olijfolie") || n.Contains("zonnebloemolie")    ? 3.49m :
+            n.Contains("chips")                                         ? 2.49m :
+            n.Contains("chocolade") || n.Contains("chocolate")         ? 2.29m :
+            n.Contains("snoep") || n.Contains("candy")                 ? 1.99m :
+            n.Contains("nootjes") || n.Contains("pinda")               ? 3.29m :
+            n.Contains("jam") || n.Contains("pindakaas")               ? 2.49m :
+            n.Contains("suiker") || n.Contains("zout")                 ? 1.29m :
+            n.Contains("bloem") || n.Contains("meel")                  ? 1.49m :
+            // ── Persoonlijke verzorging ────────────────────────────────────
+            n.Contains("shampoo")                                       ? 4.49m :
+            n.Contains("douchegel") || n.Contains("showergel")         ? 3.49m :
+            n.Contains("tandpasta") || n.Contains("toothpaste")        ? 2.99m :
+            n.Contains("deodorant")                                     ? 3.99m :
+            n.Contains("scheergel") || n.Contains("scheermesje")       ? 4.99m :
+            n.Contains("conditioner")                                   ? 4.49m :
+            n.Contains("zeep") || n.Contains("soap")                   ? 2.29m :
+            n.Contains("zonnebrand")                                    ? 7.99m :
+            // ── Huishouden ────────────────────────────────────────────────
+            n.Contains("ariel") || n.Contains("persil")
+                || n.Contains("dash")                                   ? 9.99m :
+            n.Contains("wasmiddel") || n.Contains("waspoeder")         ? 8.49m :
+            n.Contains("wasverzachter")                                 ? 4.99m :
+            n.Contains("afwasmiddel") || n.Contains("dreft")           ? 2.99m :
+            n.Contains("vaatwastabletten")                              ? 6.99m :
+            n.Contains("wc papier") || n.Contains("toiletpapier")      ? 5.49m :
+            n.Contains("keukenpapier")                                  ? 3.49m :
+            n.Contains("vuilniszak") || n.Contains("afvalzak")         ? 3.99m :
+            n.Contains("schoonmaakmiddel") || n.Contains("reiniger")   ? 3.49m :
+            n.Contains("bleek") || n.Contains("javel")                 ? 2.49m :
+            // ── Baby ──────────────────────────────────────────────────────
+            n.Contains("luier") || n.Contains("pampers")               ? 14.99m :
+            n.Contains("babyvoeding") || n.Contains("flesvoeding")     ? 12.99m :
+            // ── Algemene fallback ─────────────────────────────────────────
+            0m; // 0 = geen match, gebruik categoriegebaseerde fallback
+
+        if (basePrice <= 0) return 0;
+
+        // Biologisch = ~25% duurder
+        if (n.Contains("biologisch") || n.Contains(" bio ") || n.StartsWith("bio "))
+            basePrice = Math.Round(basePrice * 1.25m, 2);
+
+        // Winkel multiplier
+        decimal multiplier = store switch
+        {
+            "Aldi" or "Aldi BE"               => 0.80m,
+            "Aldi Süd"                        => 0.81m,
+            "Lidl" or "Lidl BE" or "Lidl DE"  => 0.83m,
+            "Netto" or "Kaufland"             => 0.84m,
+            "Dirk"                            => 0.88m,
+            "Colruyt"                         => 0.90m,
+            "Plus" or "Coop" or "Spar"        => 0.96m,
+            "Jumbo"                           => 0.97m,
+            "Delhaize"                        => 0.99m,
+            "Rewe"                            => country == "DE" ? 0.87m : 0.92m,
+            "Edeka"                           => 0.95m,
+            "Albert Heijn"                    => 1.08m,
+            "Carrefour"                       => 0.94m,
+            _                                 => country switch { "DE" => 0.87m, "BE" => 0.92m, _ => 1.00m }
+        };
+
+        return Math.Round(basePrice * multiplier, 2);
     }
 
     private static decimal EstimatePriceFromCategory(string category, string store, string country)
