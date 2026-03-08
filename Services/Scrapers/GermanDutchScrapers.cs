@@ -2,6 +2,7 @@ using SmartShopper.API.Models;
 using System.Text.Json;
 using System.Globalization;
 using HtmlAgilityPack;
+using ScraperResult = SmartShopper.API.Models.ScraperResult;
 
 namespace SmartShopper.API.Services.Scrapers;
 
@@ -716,10 +717,4 @@ public class EdekaScraper
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Shared helper type
-// ─────────────────────────────────────────────────────────────────
-public record ScraperResult(string ProductName, decimal Price, bool Success)
-{
-    public bool IsPromo { get; init; }
-}
+
