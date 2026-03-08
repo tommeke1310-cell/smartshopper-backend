@@ -51,46 +51,30 @@ public class JumboScraper
     {
         try
         {
-            // GraphQL query die de Jumbo website zelf ook gebruikt
-            var query = new
-            {
-                operationName = "SearchProducts",
-                query = @"query SearchProducts($searchTerm: String!, $pageSize: Int) {
-                    searchProducts(searchTerm: $searchTerm, pageSize: $pageSize) {
-                        products {
-                            title
-                            prices {
-                                price { amount }
-                                promotionalPrice { amount }
-                            }
-                            brand
-                        }
-                    }
-                }",
-                variables = new { searchTerm = item.Name, pageSize = 5 }
-            };
+            // Jumbo webshop zoek API (REST, stabieler dan GraphQL)
+            var url = $"https://www.jumbo.com/api/search-page/v1?searchType=keyword" +
+                      $"&searchTerms={Uri.EscapeDataString(item.Name)}&pageSize=5&currentPage=0";
 
-            using var req = new HttpRequestMessage(HttpMethod.Post, "https://www.jumbo.com/api/graphql");
-            req.Content = JsonContent.Create(query);
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
             req.Headers.TryAddWithoutValidation("Origin", "https://www.jumbo.com");
 
-            using var cts      = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-            var response = await _http.SendAsync(req, cts.Token);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            var response  = await _http.SendAsync(req, cts.Token);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Jumbo GraphQL: {Status} voor '{Product}'", response.StatusCode, item.Name);
+                _logger.LogWarning("Jumbo REST: {Status} voor '{Product}'", response.StatusCode, item.Name);
                 return [];
             }
 
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
 
-            if (!doc.RootElement.TryGetProperty("data", out var data)) return [];
-            if (!data.TryGetProperty("searchProducts", out var sp)) return [];
-            if (!sp.TryGetProperty("products", out var products)) return [];
+            // REST structuur: { "products": { "items": [...] } }
+            if (!doc.RootElement.TryGetProperty("products", out var productsRoot)) return [];
+            if (!productsRoot.TryGetProperty("items", out var items)) return [];
 
-            return ParseGraphQLProducts(products, item.Name);
+            return ParseGraphQLProducts(items, item.Name);
         }
         catch (Exception ex)
         {

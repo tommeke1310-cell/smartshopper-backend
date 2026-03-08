@@ -33,7 +33,16 @@ public static class PlaywrightPool
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--no-zygote",
-                    "--single-process",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--hide-scrollbars",
+                    "--metrics-recording-only",
+                    "--mute-audio",
+                    "--no-first-run",
+                    "--safebrowsing-disable-auto-update",
                 }
             });
             return _browser;
