@@ -6,11 +6,11 @@ using HtmlAgilityPack;
 namespace SmartShopper.API.Services.Scrapers;
 
 // ─────────────────────────────────────────────────────────────────
-//  LIDL  (NL / BE / DE)
+//  LIDL  (NL / BE / DE)  — via Lidl Plus consumer API
 // ─────────────────────────────────────────────────────────────────
 public class LidlScraper
 {
-    private readonly HttpClient          _http;
+    private readonly HttpClient           _http;
     private readonly ILogger<LidlScraper> _logger;
 
     public LidlScraper(HttpClient http, ILogger<LidlScraper> logger)
@@ -18,22 +18,21 @@ public class LidlScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9,de;q=0.8");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string country = "NL")
     {
-        var raw = await TryLidlApi(item.Name, country);
+        var raw = await TryLidlPlusApi(item.Name, country);
+        if (!raw.Success) raw = await TryLidlApi(item.Name, country);
         if (!raw.Success) raw = await TryLidlHtml(item.Name, country);
-
         if (!raw.Success) return [];
 
-        bool isBio   = raw.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
-                       raw.ProductName.Contains("biologisch", StringComparison.OrdinalIgnoreCase);
-        bool isVegan = raw.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase);
         var storeName = country switch { "DE" => "Lidl DE", "BE" => "Lidl BE", _ => "Lidl" };
+        bool isBio    = raw.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
+                        raw.ProductName.Contains("biologisch", StringComparison.OrdinalIgnoreCase);
 
         return [new ProductMatch
         {
@@ -45,12 +44,69 @@ public class LidlScraper
             IsEstimated     = false,
             MatchConfidence = WordScore(item.Name, raw.ProductName),
             IsBiologisch    = isBio,
-            IsVegan         = isVegan,
-            IsHuisMerk      = true,  // Lidl verkoopt vrijwel uitsluitend huismerk
+            IsVegan         = raw.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase),
+            IsHuisMerk      = true,
             IsAMerk         = false,
         }];
     }
 
+    // ─── Lidl Plus / consumer-api ─────────────────────────────────
+    private async Task<ScraperResult> TryLidlPlusApi(string query, string country)
+    {
+        try
+        {
+            var (locale, countryCode) = country switch
+            {
+                "DE" => ("de-DE", "DE"),
+                "BE" => ("nl-BE", "BE"),
+                _    => ("nl-NL", "NL")
+            };
+
+            var url = $"https://consumer-api.lidl.com/api/comstrat/assortment/v2/search/category" +
+                      $"?query={Uri.EscapeDataString(query)}&pageSize=5&language={locale}&country={countryCode}";
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("App-Version", "26.13.0");
+            req.Headers.TryAddWithoutValidation("X-AppID", "com.lidl.eci.lidlplus");
+
+            var response = await _http.SendAsync(req);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+
+            // Structuur: { "results": [...] } of { "data": [...] }
+            JsonElement items;
+            if (!doc.RootElement.TryGetProperty("results", out items) &&
+                !doc.RootElement.TryGetProperty("data",    out items))
+                return new ScraperResult(query, 0, false);
+
+            foreach (var item in items.EnumerateArray())
+            {
+                decimal price = 0;
+                if (item.TryGetProperty("price", out var po))
+                {
+                    price = po.TryGetProperty("price",        out var p1) ? p1.GetDecimal() :
+                            po.TryGetProperty("regularPrice", out var p2) ? p2.GetDecimal() : 0;
+                }
+                if (item.TryGetProperty("currentRetailPrice", out var crp))
+                    price = crp.GetDecimal();
+
+                if (price <= 0) continue;
+
+                var title = item.TryGetProperty("fullTitle", out var ft) ? ft.GetString() ?? query :
+                            item.TryGetProperty("name",      out var n)  ? n.GetString()  ?? query : query;
+                bool isPromo = item.TryGetProperty("isDiscount", out var isd) && isd.GetBoolean();
+
+                _logger.LogInformation("Lidl Plus {Country}: {Product} → €{Price}", country, title, price);
+                return new ScraperResult(title, price, true) { IsPromo = isPromo };
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Lidl Plus API mislukt voor {Product}", query); }
+        return new ScraperResult(query, 0, false);
+    }
+
+    // ─── Lidl gridboxes API ───────────────────────────────────────
     private async Task<ScraperResult> TryLidlApi(string query, string country)
     {
         try
@@ -81,23 +137,17 @@ public class LidlScraper
                 {
                     decimal price = ExtractLidlPrice(item);
                     if (price <= 0) continue;
-
                     string title = item.TryGetProperty("keyfacts", out var kf) &&
-                                   kf.TryGetProperty("name", out var n)
+                                   kf.TryGetProperty("name",      out var n)
                                    ? n.GetString() ?? query : query;
-
                     bool isPromo = item.TryGetProperty("price", out var po) &&
                                    po.TryGetProperty("discount", out _);
-
-                    _logger.LogInformation("Lidl {Country}: {Product} → €{Price}", country, title, price);
+                    _logger.LogInformation("Lidl grid {Country}: {Product} → €{Price}", country, title, price);
                     return new ScraperResult(title, price, true) { IsPromo = isPromo };
                 }
             }
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Lidl API mislukt voor {Product} ({Country})", query, country);
-        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Lidl API mislukt voor {Product}", query); }
         return new ScraperResult(query, 0, false);
     }
 
@@ -105,16 +155,13 @@ public class LidlScraper
     {
         if (item.TryGetProperty("price", out var priceObj))
         {
-            if (priceObj.TryGetProperty("price", out var p) && p.ValueKind == JsonValueKind.Number)
-                return p.GetDecimal();
-            if (priceObj.TryGetProperty("regularPrice", out var rp) && rp.ValueKind == JsonValueKind.Number)
-                return rp.GetDecimal();
+            if (priceObj.TryGetProperty("price",        out var p) && p.ValueKind == JsonValueKind.Number) return p.GetDecimal();
+            if (priceObj.TryGetProperty("regularPrice", out var rp) && rp.ValueKind == JsonValueKind.Number) return rp.GetDecimal();
         }
         if (item.TryGetProperty("priceString", out var ps))
         {
-            var priceStr = ps.GetString()?.Replace(",", ".") ?? "";
-            if (decimal.TryParse(priceStr, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal parsed))
-                return parsed;
+            var str = ps.GetString()?.Replace(",", ".") ?? "";
+            if (decimal.TryParse(str, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p2)) return p2;
         }
         return 0;
     }
@@ -127,31 +174,24 @@ public class LidlScraper
             var url    = country == "DE"
                 ? $"https://www.lidl.de/suche?query={Uri.EscapeDataString(query)}"
                 : $"https://www.{domain}/zoeken/?q={Uri.EscapeDataString(query)}";
-
             var response = await _http.GetAsync(url);
             if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
             var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
-
             var priceNode = doc.DocumentNode.SelectSingleNode(
                 "//span[contains(@class,'m-price__price')] | " +
                 "//span[contains(@class,'pricebox__price')] | " +
                 "//div[contains(@class,'product-grid-box')]//span[contains(@class,'price')]");
-
             if (priceNode != null)
             {
-                var priceText = System.Text.RegularExpressions.Regex.Match(
+                var m = System.Text.RegularExpressions.Regex.Match(
                     priceNode.InnerText.Replace(",", "."), @"\d+\.\d{2}").Value;
-                if (decimal.TryParse(priceText, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal price) && price > 0)
-                {
-                    _logger.LogInformation("Lidl HTML {Country}: {Product} → €{Price}", country, query, price);
-                    return new ScraperResult(query, price, true);
-                }
+                if (decimal.TryParse(m, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p) && p > 0)
+                    return new ScraperResult(query, p, true);
             }
         }
         catch (Exception ex) { _logger.LogError(ex, "Lidl HTML fout voor {Product}", query); }
-
         return new ScraperResult(query, 0, false);
     }
 
@@ -164,7 +204,7 @@ public class LidlScraper
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  ALDI  (NL / BE / DE via Aldi Süd)
+//  ALDI  (NL / BE / DE)
 // ─────────────────────────────────────────────────────────────────
 public class AldiScraper
 {
@@ -176,22 +216,21 @@ public class AldiScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string country = "NL")
     {
         var raw = country == "DE"
             ? await ScrapeAldiSued(item.Name)
-            : await ScrapeAldiNlBe(item.Name, country);
+            : await ScrapeAldiNl(item.Name, country);
 
         if (!raw.Success) return [];
 
-        bool isBio   = raw.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
-                       raw.ProductName.Contains("biologisch", StringComparison.OrdinalIgnoreCase);
-        bool isVegan = raw.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase);
         var storeName = country == "DE" ? "Aldi Süd" : (country == "BE" ? "Aldi BE" : "Aldi");
+        bool isBio    = raw.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase);
 
         return [new ProductMatch
         {
@@ -203,13 +242,69 @@ public class AldiScraper
             IsEstimated     = false,
             MatchConfidence = WordScore(item.Name, raw.ProductName),
             IsBiologisch    = isBio,
-            IsVegan         = isVegan,
-            IsHuisMerk      = true,   // Aldi verkoopt vrijwel uitsluitend huismerk
+            IsVegan         = raw.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase),
+            IsHuisMerk      = true,
             IsAMerk         = false,
         }];
     }
 
-    private async Task<ScraperResult> ScrapeAldiNlBe(string query, string country)
+    // ─── Aldi NL/BE via JSON API ──────────────────────────────────
+    private async Task<ScraperResult> ScrapeAldiNl(string query, string country)
+    {
+        try
+        {
+            // Aldi NL heeft een interne JSON search API
+            var domain = country == "BE" ? "aldi.be" : "aldi.nl";
+            var url    = $"https://www.{domain}/api/search?q={Uri.EscapeDataString(query)}&pageSize=5";
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
+            req.Headers.TryAddWithoutValidation("Referer", $"https://www.{domain}/");
+
+            var response = await _http.SendAsync(req);
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+
+                JsonElement items;
+                if (doc.RootElement.TryGetProperty("products",     out items) ||
+                    doc.RootElement.TryGetProperty("searchResults", out items) ||
+                    doc.RootElement.TryGetProperty("results",       out items))
+                {
+                    foreach (var p in items.EnumerateArray())
+                    {
+                        decimal price = ExtractAldiJsonPrice(p);
+                        if (price <= 0) continue;
+                        var name = p.TryGetProperty("name",  out var n) ? n.GetString() ?? query :
+                                   p.TryGetProperty("title", out var t) ? t.GetString() ?? query : query;
+                        _logger.LogInformation("Aldi {Country} JSON: {Product} → €{Price}", country, name, price);
+                        return new ScraperResult(name, price, true);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Aldi NL JSON API mislukt voor {Product}", query); }
+
+        // Fallback: HTML scraping
+        return await ScrapeAldiNlHtml(query, country);
+    }
+
+    private static decimal ExtractAldiJsonPrice(JsonElement p)
+    {
+        string[] priceFields = ["price", "currentPrice", "regularPrice", "normalPrice"];
+        foreach (var field in priceFields)
+        {
+            if (!p.TryGetProperty(field, out var po)) continue;
+            if (po.ValueKind == JsonValueKind.Number) return po.GetDecimal();
+            if (po.TryGetProperty("value",   out var v))  return v.GetDecimal();
+            if (po.TryGetProperty("amount",  out var a))  return a.GetDecimal();
+            if (po.TryGetProperty("regular", out var reg) && reg.ValueKind == JsonValueKind.Number) return reg.GetDecimal();
+        }
+        return 0;
+    }
+
+    private async Task<ScraperResult> ScrapeAldiNlHtml(string query, string country)
     {
         try
         {
@@ -217,22 +312,23 @@ public class AldiScraper
             var url    = $"https://www.{domain}/nl/zoeken.html?q={Uri.EscapeDataString(query)}";
             var response = await _http.GetAsync(url);
             if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
-            var html   = await response.Content.ReadAsStringAsync();
-            var doc    = new HtmlDocument();
+            var html = await response.Content.ReadAsStringAsync();
+            var doc  = new HtmlDocument();
             doc.LoadHtml(html);
             return ExtractAldiPrice(doc, query);
         }
-        catch (Exception ex) { _logger.LogError(ex, "Aldi NL/BE fout voor {Product}", query); }
+        catch (Exception ex) { _logger.LogError(ex, "Aldi NL HTML fout voor {Product}", query); }
         return new ScraperResult(query, 0, false);
     }
 
+    // ─── Aldi Süd (DE) ────────────────────────────────────────────
     private async Task<ScraperResult> ScrapeAldiSued(string query)
     {
         try
         {
-            var apiUrl = $"https://api.aldi-sued.de/v1/search" +
-                         $"?term={Uri.EscapeDataString(query)}&page=1&pageSize=5&country=DE";
-            using var req = new HttpRequestMessage(HttpMethod.Get, apiUrl);
+            var url = $"https://api.aldi-sued.de/v1/search" +
+                      $"?term={Uri.EscapeDataString(query)}&page=1&pageSize=5&country=DE";
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("x-api-key", "public");
 
             var response = await _http.SendAsync(req);
@@ -265,7 +361,7 @@ public class AldiScraper
     {
         try
         {
-            var url  = $"https://www.aldi-sued.de/de/sortiment/suche.html?q={Uri.EscapeDataString(query)}";
+            var url      = $"https://www.aldi-sued.de/de/sortiment/suche.html?q={Uri.EscapeDataString(query)}";
             var response = await _http.GetAsync(url);
             if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
             var html = await response.Content.ReadAsStringAsync();
@@ -286,6 +382,8 @@ public class AldiScraper
             "//div[contains(@class,'price-box')]//span[contains(@class,'price')]",
             "//meta[@itemprop='price']",
             "//span[@class='price']",
+            "//span[contains(@class,'product-tile__price')]",
+            "//div[contains(@class,'product-tile')]//span[contains(@class,'price')]",
         ];
         foreach (var sel in selectors)
         {
@@ -320,7 +418,7 @@ public class DmScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
     }
 
@@ -340,7 +438,6 @@ public class DmScraper
 
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
-
             if (!doc.RootElement.TryGetProperty("products", out var products))
                 return await TryDmHtml(item, country);
 
@@ -351,16 +448,14 @@ public class DmScraper
                     price = v.GetDecimal();
                 if (price <= 0) continue;
 
-                var name  = p.TryGetProperty("name",  out var n) ? n.GetString() ?? "" : item.Name;
-                bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
-                             name.Contains("biologisch", StringComparison.OrdinalIgnoreCase);
+                var name  = p.TryGetProperty("name", out var n) ? n.GetString() ?? "" : item.Name;
+                bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase);
 
                 _logger.LogInformation("DM {Country}: {Product} → €{Price}", country, name, price);
                 return [new ProductMatch
                 {
                     StoreName = "DM", Country = country, ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio,
-                    MatchConfidence = WordScore(item.Name, name)
+                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = WordScore(item.Name, name)
                 }];
             }
         }
@@ -376,10 +471,9 @@ public class DmScraper
             var url    = $"https://www.{domain}/search?query={Uri.EscapeDataString(item.Name)}";
             var resp   = await _http.GetAsync(url);
             if (!resp.IsSuccessStatusCode) return [];
-            var html   = await resp.Content.ReadAsStringAsync();
-            var doc    = new HtmlDocument();
+            var html = await resp.Content.ReadAsStringAsync();
+            var doc  = new HtmlDocument();
             doc.LoadHtml(html);
-
             var priceNode = doc.DocumentNode.SelectSingleNode(
                 "//span[contains(@class,'price') and not(contains(@class,'old'))]");
             if (priceNode != null)
@@ -419,7 +513,7 @@ public class ReweScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "de-DE,de;q=0.9");
     }
@@ -428,7 +522,6 @@ public class ReweScraper
     {
         try
         {
-            // marketId 562223 = REWE Aachen (dichtbij NL grens)
             var url = $"https://shop.rewe.de/api/v7/products" +
                       $"?search={Uri.EscapeDataString(item.Name)}" +
                       $"&page=1&pageSize=5&marketId=562223&sorting=RELEVANCE";
@@ -445,24 +538,21 @@ public class ReweScraper
 
             JsonElement products;
             if (!doc.RootElement.TryGetProperty("products", out products) &&
-                !doc.RootElement.TryGetProperty("items", out products))
+                !doc.RootElement.TryGetProperty("items",    out products))
                 return await TryReweHtml(item);
 
             foreach (var p in products.EnumerateArray())
             {
                 decimal price = ExtractRewePrice(p);
                 if (price <= 0) continue;
-
-                var name  = p.TryGetProperty("name",  out var n) ? n.GetString() ?? "" :
-                            p.TryGetProperty("title", out var t) ? t.GetString() ?? "" : item.Name;
+                var name = p.TryGetProperty("name",  out var n) ? n.GetString() ?? "" :
+                           p.TryGetProperty("title", out var t) ? t.GetString() ?? "" : item.Name;
                 bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase);
-
                 _logger.LogInformation("REWE DE: {Product} → €{Price}", name, price);
                 return [new ProductMatch
                 {
                     StoreName = "Rewe", Country = "DE", ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio,
-                    MatchConfidence = WordScore(item.Name, name)
+                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = WordScore(item.Name, name)
                 }];
             }
         }
@@ -489,13 +579,12 @@ public class ReweScraper
     {
         try
         {
-            var url  = $"https://www.rewe.de/suche/?search={Uri.EscapeDataString(item.Name)}";
-            var response = await _http.GetAsync(url);
+            var response = await _http.GetAsync(
+                $"https://www.rewe.de/suche/?search={Uri.EscapeDataString(item.Name)}");
             if (!response.IsSuccessStatusCode) return [];
             var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
-
             var node = doc.DocumentNode.SelectSingleNode(
                 "//*[@data-testid='product-price'] | //span[contains(@class,'price__value')]");
             if (node != null)
@@ -535,8 +624,8 @@ public class EdekaScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "de-DE,de;q=0.9");
     }
 
@@ -565,17 +654,14 @@ public class EdekaScraper
             {
                 decimal price = ExtractEdekaPrice(p);
                 if (price <= 0) continue;
-
-                var name  = p.TryGetProperty("title", out var t) ? t.GetString() ?? "" :
-                            p.TryGetProperty("name",  out var n) ? n.GetString() ?? "" : item.Name;
+                var name = p.TryGetProperty("title", out var t) ? t.GetString() ?? "" :
+                           p.TryGetProperty("name",  out var n) ? n.GetString() ?? "" : item.Name;
                 bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase);
-
                 _logger.LogInformation("Edeka DE: {Product} → €{Price}", name, price);
                 return [new ProductMatch
                 {
                     StoreName = "Edeka", Country = "DE", ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio,
-                    MatchConfidence = WordScore(item.Name, name)
+                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = WordScore(item.Name, name)
                 }];
             }
         }
@@ -598,13 +684,12 @@ public class EdekaScraper
     {
         try
         {
-            var url  = $"https://www.edeka.de/produkte/suchergebnis.jsp?query={Uri.EscapeDataString(item.Name)}";
-            var response = await _http.GetAsync(url);
+            var response = await _http.GetAsync(
+                $"https://www.edeka.de/produkte/suchergebnis.jsp?query={Uri.EscapeDataString(item.Name)}");
             if (!response.IsSuccessStatusCode) return [];
             var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
-
             var node = doc.DocumentNode.SelectSingleNode(
                 "//span[contains(@class,'product-detail__price')] | //p[contains(@class,'product-tile__price')]");
             if (node != null)
@@ -629,4 +714,12 @@ public class EdekaScraper
         if (words.Length == 0) return 0;
         return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Shared helper type
+// ─────────────────────────────────────────────────────────────────
+public record ScraperResult(string ProductName, decimal Price, bool Success)
+{
+    public bool IsPromo { get; init; }
 }
