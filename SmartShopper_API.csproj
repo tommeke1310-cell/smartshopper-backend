@@ -17,8 +17,7 @@
     <!-- Swagger -->
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.9.0" />
 
-    <!-- Playwright: headless browser voor scraping -->
-    <PackageReference Include="Microsoft.Playwright" Version="1.44.0" />
+    <!-- Playwright VERWIJDERD: geblokkeerd op Railway door supermarkt IP-filters -->
   </ItemGroup>
 
 </Project>
