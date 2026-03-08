@@ -304,6 +304,11 @@ public class AlbertHeijnScraper
 // Als leeg → directe verbinding (huidig gedrag)
 public static class ProxyConfig
 {
+    // Bekende proxy-providers die een eigen CA-certificaat gebruiken.
+    // SSL-validatie wordt ALLEEN uitgeschakeld als de proxy-URL een van deze domeinen bevat.
+    private static readonly string[] KnownProxyProviders =
+        ["brightdata.com", "oxylabs.io", "smartproxy.com", "zyte.com", "iproyal.com"];
+
     public static HttpClient CreateClient(string envVarName, ILogger logger)
     {
         var proxyUrl = Environment.GetEnvironmentVariable(envVarName);
@@ -311,13 +316,21 @@ public static class ProxyConfig
         {
             try
             {
+                bool isKnownProvider = KnownProxyProviders.Any(p =>
+                    proxyUrl.Contains(p, StringComparison.OrdinalIgnoreCase));
+
                 var handler = new HttpClientHandler
                 {
                     Proxy = new System.Net.WebProxy(proxyUrl, true),
                     UseProxy = true,
-                    ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+                    // SSL-validatie alleen uitschakelen voor bekende proxy-providers
+                    // die een eigen CA gebruiken. Nooit voor willekeurige proxy-URLs.
+                    ServerCertificateCustomValidationCallback = isKnownProvider
+                        ? (_, _, _, _) => true
+                        : null,
                 };
-                logger.LogInformation("Proxy actief voor {Env}: {Proxy}", envVarName, proxyUrl);
+                logger.LogInformation("Proxy actief voor {Env}: {Proxy} (SSL-validatie: {Ssl})",
+                    envVarName, proxyUrl, isKnownProvider ? "uitgeschakeld" : "actief");
                 return new HttpClient(handler);
             }
             catch (Exception ex)

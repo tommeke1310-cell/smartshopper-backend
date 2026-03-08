@@ -41,8 +41,27 @@ builder.Services.AddSwaggerGen(c =>
     c.SwaggerDoc("v1", new() { Title = "SmartShopper API", Version = "v1" });
 });
 
-builder.Services.AddCors(o => o.AddPolicy("AllowAll",
-    p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
+// ─── CORS: alleen bekende origins toestaan ────────────────────────
+// Voeg extra origins toe via de env var CORS_ALLOWED_ORIGINS (kommagescheiden).
+// Standaard: Expo dev tools + productie app scheme.
+var allowedOrigins = new List<string>
+{
+    "https://smartshopper.app",
+    "http://localhost:8081",
+    "http://localhost:19006",
+    "exp://localhost:8081",
+};
+
+var extraOrigins = Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS");
+if (!string.IsNullOrWhiteSpace(extraOrigins))
+    allowedOrigins.AddRange(extraOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+builder.Services.AddCors(o => o.AddPolicy("AllowApp",
+    p => p
+        .WithOrigins([.. allowedOrigins])
+        .WithMethods("GET", "POST", "PATCH", "DELETE", "OPTIONS")
+        .WithHeaders("Content-Type", "Authorization", "apikey", "x-client-info")
+        .AllowCredentials()));
 
 // ─── Helpers voor Polly retry + circuit breaker ────────────────────
 static void AddScraperResilience(IHttpClientBuilder b) =>
@@ -118,6 +137,18 @@ builder.Services.AddHttpClient<BackgroundScraperService>(c => c.Timeout = TimeSp
 // ─── Cache + Memory ──────────────────────────────────────────────
 builder.Services.AddMemoryCache();
 
+// ─── Rate Limiting (10 compare-requests/minuut per IP) ───────────
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddFixedWindowLimiter("compare", o =>
+    {
+        o.Window = TimeSpan.FromMinutes(1);
+        o.PermitLimit = 10;
+        o.QueueLimit = 0;
+    });
+    options.RejectionStatusCode = 429;
+});
+
 // ─── Logging ─────────────────────────────────────────────────────
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
@@ -129,8 +160,35 @@ var app = builder.Build();
 app.UseSwagger();
 app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "SmartShopper API v1"));
 
-app.UseCors("AllowAll");
+app.UseCors("AllowApp");
+
+// ─── API-key verificatie (minimale beveiliging voor compare/behavior) ─
+// Stel in als Railway env var: API_SECRET_KEY=<willekeurige lange string>
+// De app stuurt deze mee als header: X-Api-Key: <waarde>
+// Als de env var leeg is → open toegang (achterwaarts compatibel voor dev)
+var apiSecretKey = Environment.GetEnvironmentVariable("API_SECRET_KEY") ?? "";
+if (!string.IsNullOrWhiteSpace(apiSecretKey))
+{
+    app.Use(async (context, next) =>
+    {
+        // Swagger en health endpoints zijn altijd vrij
+        var path = context.Request.Path.Value ?? "";
+        bool isPublic = path.StartsWith("/swagger") || path == "/health" || path == "/";
+        if (!isPublic)
+        {
+            if (!context.Request.Headers.TryGetValue("X-Api-Key", out var key) || key != apiSecretKey)
+            {
+                context.Response.StatusCode = 401;
+                await context.Response.WriteAsJsonAsync(new { error = "Unauthorized" });
+                return;
+            }
+        }
+        await next();
+    });
+}
+
 app.UseAuthorization();
+app.UseRateLimiter();
 app.MapControllers();
 
 app.MapGet("/health", () => new
