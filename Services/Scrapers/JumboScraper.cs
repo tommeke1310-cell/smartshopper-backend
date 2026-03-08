@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Globalization;
+using HtmlAgilityPack;
 using SmartShopper.API.Models;
 
 namespace SmartShopper.API.Services.Scrapers;
@@ -17,61 +19,26 @@ public class JumboScraper
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "text/html,application/json,*/*");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://www.jumbo.com/");
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item)
     {
-        // Stap 1: Jumbo v17 mobile API
-        var results = await TryMobileApi(item);
+        // Stap 1: webshop JSON API
+        var results = await TryWebshopApi(item);
         if (results.Count > 0) return results;
 
-        // Stap 2: Jumbo webshop search-page API
-        results = await TryWebshopApi(item);
+        // Stap 2: HTML pagina parsen
+        results = await TryHtmlScrape(item);
         if (results.Count > 0) return results;
 
         _logger.LogWarning("Jumbo: geen resultaten voor '{Product}'", item.Name);
         return [];
     }
 
-    // ─── Jumbo mobile API v17 ─────────────────────────────────────
-    private async Task<List<ProductMatch>> TryMobileApi(GroceryItem item)
-    {
-        try
-        {
-            var url = $"https://mobileapi.jumbo.com/v17/search" +
-                      $"?q={Uri.EscapeDataString(item.Name)}&pageSize=5&currentPage=0&language=nl";
-
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("x-jumbo-app-version", "10.0.0");
-            req.Headers.TryAddWithoutValidation("app-version", "10.0.0");
-
-            var response = await _http.SendAsync(req);
-            if (!response.IsSuccessStatusCode)
-            {
-                _logger.LogWarning("Jumbo mobile API: {Status}", response.StatusCode);
-                return [];
-            }
-
-            var json = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
-
-            // Structuur: { "products": { "data": [...] } }
-            if (!doc.RootElement.TryGetProperty("products", out var pr)) return [];
-            if (!pr.TryGetProperty("data", out var data)) return [];
-
-            return ParseJumboProducts(data, item.Name, "mobile");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Jumbo mobile API mislukt voor '{Product}'", item.Name);
-            return [];
-        }
-    }
-
-    // ─── Jumbo webshop API fallback ───────────────────────────────
+    // ─── Jumbo webshop JSON API ───────────────────────────────────
     private async Task<List<ProductMatch>> TryWebshopApi(GroceryItem item)
     {
         try
@@ -82,16 +49,25 @@ public class JumboScraper
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
 
-            var response = await _http.SendAsync(req);
-            if (!response.IsSuccessStatusCode) return [];
+            var resp = await _http.SendAsync(req);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Jumbo webshop API: {Status}", resp.StatusCode);
+                return [];
+            }
 
-            var json = await response.Content.ReadAsStringAsync();
+            var json = await resp.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
 
-            if (!doc.RootElement.TryGetProperty("products", out var productsRoot)) return [];
-            if (!productsRoot.TryGetProperty("items", out var items)) return [];
+            // Twee mogelijke structuren: { products: { items: [...] } } of { data: [...] }
+            JsonElement items;
+            if (doc.RootElement.TryGetProperty("products", out var pr) &&
+                pr.TryGetProperty("items", out items))
+            {
+                return ParseItems(items, item.Name);
+            }
 
-            return ParseJumboProducts(items, item.Name, "webshop");
+            return [];
         }
         catch (Exception ex)
         {
@@ -100,85 +76,143 @@ public class JumboScraper
         }
     }
 
-    private List<ProductMatch> ParseJumboProducts(JsonElement items, string query, string source)
+    // ─── HTML scraping fallback ───────────────────────────────────
+    private async Task<List<ProductMatch>> TryHtmlScrape(GroceryItem item)
+    {
+        try
+        {
+            var url  = $"https://www.jumbo.com/zoeken/?q={Uri.EscapeDataString(item.Name)}";
+            var resp = await _http.GetAsync(url);
+            if (!resp.IsSuccessStatusCode) return [];
+
+            var html = await resp.Content.ReadAsStringAsync();
+
+            // Probeer JSON-LD data uit de HTML te halen
+            var jsonLdMatch = System.Text.RegularExpressions.Regex.Match(
+                html, @"<script[^>]*type=""application/ld\+json""[^>]*>(.*?)</script>",
+                System.Text.RegularExpressions.RegexOptions.Singleline);
+
+            if (jsonLdMatch.Success)
+            {
+                try
+                {
+                    var jsonLd = jsonLdMatch.Groups[1].Value.Trim();
+                    using var doc = JsonDocument.Parse(jsonLd);
+                    if (doc.RootElement.TryGetProperty("offers", out var offers))
+                    {
+                        decimal price = 0;
+                        if (offers.TryGetProperty("price", out var p))
+                            decimal.TryParse(p.GetString()?.Replace(",", "."),
+                                NumberStyles.Any, CultureInfo.InvariantCulture, out price);
+                        var name = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() ?? item.Name : item.Name;
+                        if (price > 0)
+                        {
+                            _logger.LogInformation("Jumbo JSON-LD: {Product} → €{Price}", name, price);
+                            return [new ProductMatch
+                            {
+                                StoreName = "Jumbo", Country = "NL", ProductName = name,
+                                Price = price, IsEstimated = false, MatchConfidence = WordScore(item.Name, name),
+                                LastUpdated = DateTime.UtcNow
+                            }];
+                        }
+                    }
+                }
+                catch { /* JSON-LD parsing mislukt, ga door naar HTML */ }
+            }
+
+            // HTML prijs selectors
+            var htmlDoc = new HtmlDocument();
+            htmlDoc.LoadHtml(html);
+
+            var priceNode = htmlDoc.DocumentNode.SelectSingleNode(
+                "//span[contains(@class,'jum-price')]//span[contains(@class,'integer')] | " +
+                "//div[contains(@class,'product-price')] | " +
+                "//*[@data-testid='price-amount'] | " +
+                "//span[contains(@class,'price-amount')]");
+
+            if (priceNode != null)
+            {
+                var raw = System.Text.RegularExpressions.Regex.Match(
+                    priceNode.InnerText.Replace(",", "."), @"\d+[\.,]\d{2}").Value;
+                if (decimal.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p) && p > 0)
+                {
+                    // Probeer ook productnaam te vinden
+                    var nameNode = htmlDoc.DocumentNode.SelectSingleNode(
+                        "//h2[contains(@class,'product-title')] | //h3[contains(@class,'product-title')] | " +
+                        "//*[@data-testid='product-title']");
+                    var name = nameNode?.InnerText?.Trim() ?? item.Name;
+
+                    _logger.LogInformation("Jumbo HTML: {Product} → €{Price}", name, p);
+                    return [new ProductMatch
+                    {
+                        StoreName = "Jumbo", Country = "NL", ProductName = name,
+                        Price = p, IsEstimated = false, MatchConfidence = WordScore(item.Name, name),
+                        LastUpdated = DateTime.UtcNow
+                    }];
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Jumbo HTML scraping mislukt voor '{Product}'", item.Name);
+        }
+        return [];
+    }
+
+    private List<ProductMatch> ParseItems(JsonElement items, string query)
     {
         var results = new List<ProductMatch>();
-
         foreach (var p in items.EnumerateArray())
         {
             decimal price = 0;
             bool isPromo = false;
             string promoText = "";
 
-            // Mobile API structuur: p.data.prices of p.prices
-            var priceRoot = p.TryGetProperty("data", out var d) ? d : p;
-
-            if (priceRoot.TryGetProperty("prices", out var prices))
+            if (p.TryGetProperty("prices", out var prices))
             {
-                if (prices.TryGetProperty("price", out var priceObj))
+                if (prices.TryGetProperty("price", out var po))
+                    price = po.TryGetProperty("amount", out var a) ? a.GetDecimal() / 100m :
+                            po.ValueKind == JsonValueKind.Number ? po.GetDecimal() : 0;
+                if (prices.TryGetProperty("promotionalPrice", out var promo) &&
+                    promo.ValueKind != JsonValueKind.Null)
                 {
-                    price = priceObj.TryGetProperty("amount", out var amt)
-                        ? amt.GetDecimal() / 100m
-                        : priceObj.ValueKind == JsonValueKind.Number ? priceObj.GetDecimal() : 0;
-                }
-                if (prices.TryGetProperty("promotionalPrice", out var promo) && promo.ValueKind != JsonValueKind.Null)
-                {
-                    isPromo   = true;
-                    promoText = "Jumbo aanbieding";
-                    if (promo.TryGetProperty("amount", out var promoAmt))
-                        price = promoAmt.GetDecimal() / 100m;
+                    isPromo = true; promoText = "Jumbo aanbieding";
+                    if (promo.TryGetProperty("amount", out var pa)) price = pa.GetDecimal() / 100m;
                 }
             }
-            else if (priceRoot.TryGetProperty("price", out var directPrice))
-            {
-                price = directPrice.ValueKind == JsonValueKind.Number ? directPrice.GetDecimal() : 0;
-            }
+            else if (p.TryGetProperty("price", out var dp))
+                price = dp.ValueKind == JsonValueKind.Number ? dp.GetDecimal() : 0;
 
             if (price <= 0) continue;
 
-            var titleEl = priceRoot.TryGetProperty("title", out var t) ? t :
-                          priceRoot.TryGetProperty("name",  out var n) ? n : default;
-            var name = titleEl.ValueKind == JsonValueKind.String ? titleEl.GetString() ?? query : query;
-
-            var brandEl = priceRoot.TryGetProperty("brand", out var b) ? b : default;
-            var brand = brandEl.ValueKind == JsonValueKind.String ? brandEl.GetString() ?? "" : "";
-
-            bool isHuisMerk = IsHuisMerk(brand, name);
+            var name  = p.TryGetProperty("title", out var t) ? t.GetString() ?? query :
+                        p.TryGetProperty("name",  out var n) ? n.GetString() ?? query : query;
+            var brand = p.TryGetProperty("brand", out var b) ? b.GetString() ?? "" : "";
 
             results.Add(new ProductMatch
             {
-                StoreName       = "Jumbo",
-                Country         = "NL",
-                ProductName     = name,
-                Price           = price,
-                IsPromo         = isPromo,
-                PromoText       = promoText,
-                IsEstimated     = false,
+                StoreName = "Jumbo", Country = "NL", ProductName = name, Price = price,
+                IsPromo = isPromo, PromoText = promoText, IsEstimated = false,
                 MatchConfidence = WordScore(query, name),
-                IsBiologisch    = name.Contains("biologisch", StringComparison.OrdinalIgnoreCase) ||
-                                  name.Contains(" bio ", StringComparison.OrdinalIgnoreCase),
-                IsVegan         = name.Contains("vegan", StringComparison.OrdinalIgnoreCase),
-                IsHuisMerk      = isHuisMerk,
-                IsAMerk         = !isHuisMerk,
-                LastUpdated     = DateTime.UtcNow,
+                IsBiologisch = name.Contains("biologisch", StringComparison.OrdinalIgnoreCase),
+                IsVegan      = name.Contains("vegan", StringComparison.OrdinalIgnoreCase),
+                IsHuisMerk   = IsHuisMerk(brand, name), IsAMerk = !IsHuisMerk(brand, name),
+                LastUpdated  = DateTime.UtcNow,
             });
-
             if (results.Count >= 3) break;
         }
 
         if (results.Count > 0)
-            _logger.LogInformation("Jumbo {Source}: {Count} resultaten voor '{Product}'",
-                source, results.Count, query);
+            _logger.LogInformation("Jumbo webshop: {Count} voor '{Product}'", results.Count, query);
 
         return results.OrderByDescending(r => r.MatchConfidence).Take(1).ToList();
     }
 
-    private static double WordScore(string query, string product)
+    private static double WordScore(string q, string p)
     {
-        var words = query.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (words.Length == 0) return 0;
-        var lower = product.ToLower();
-        return (double)words.Count(w => lower.Contains(w)) / words.Length;
+        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
     }
 
     private static bool IsHuisMerk(string brand, string name) =>

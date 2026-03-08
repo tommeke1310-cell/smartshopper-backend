@@ -51,59 +51,58 @@ public class LidlScraper
         }];
     }
 
-    // ─── Lidl Plus / consumer-api ─────────────────────────────────
+    // ─── Lidl website zoek-API (publiek, geen IP-blokkade) ──────────
     private async Task<ScraperResult> TryLidlPlusApi(string query, string country)
     {
         try
         {
-            var (locale, countryCode) = country switch
-            {
-                "DE" => ("de-DE", "DE"),
-                "BE" => ("nl-BE", "BE"),
-                _    => ("nl-NL", "NL")
-            };
+            // Lidl gebruikt een ingebedde Next.js API op hun website
+            var domain = country switch { "DE" => "lidl.de", "BE" => "lidl.be", _ => "lidl.nl" };
+            var lang   = country switch { "DE" => "de", "BE" => "nl", _ => "nl" };
 
-            var url = $"https://consumer-api.lidl.com/api/comstrat/assortment/v2/search/category" +
-                      $"?query={Uri.EscapeDataString(query)}&pageSize=5&language={locale}&country={countryCode}";
+            // Probeer de interne API-route die de website zelf gebruikt
+            var url = $"https://www.{domain}/{lang}/s/?q={Uri.EscapeDataString(query)}&source=typeAheadSuggestion";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("App-Version", "26.13.0");
-            req.Headers.TryAddWithoutValidation("X-AppID", "com.lidl.eci.lidlplus");
+            req.Headers.TryAddWithoutValidation("Accept", "application/json, */*");
+            req.Headers.TryAddWithoutValidation("Referer", $"https://www.{domain}/");
+            req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
 
             var response = await _http.SendAsync(req);
             if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
 
             var json = await response.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(json) || json.TrimStart()[0] != '[' && json.TrimStart()[0] != '{')
+                return new ScraperResult(query, 0, false);
+
             using var doc = JsonDocument.Parse(json);
 
-            // Structuur: { "results": [...] } of { "data": [...] }
+            // Verschillende Lidl response structuren proberen
+            var root = doc.RootElement;
             JsonElement items;
-            if (!doc.RootElement.TryGetProperty("results", out items) &&
-                !doc.RootElement.TryGetProperty("data",    out items))
-                return new ScraperResult(query, 0, false);
+            bool hasItems = root.ValueKind == JsonValueKind.Array
+                ? (items = root, true)
+                : root.TryGetProperty("gridList",  out items) ||
+                  root.TryGetProperty("results",   out items) ||
+                  root.TryGetProperty("products",  out items) ||
+                  root.TryGetProperty("data",      out items);
+
+            if (!hasItems) return new ScraperResult(query, 0, false);
 
             foreach (var item in items.EnumerateArray())
             {
-                decimal price = 0;
-                if (item.TryGetProperty("price", out var po))
-                {
-                    price = po.TryGetProperty("price",        out var p1) ? p1.GetDecimal() :
-                            po.TryGetProperty("regularPrice", out var p2) ? p2.GetDecimal() : 0;
-                }
-                if (item.TryGetProperty("currentRetailPrice", out var crp))
-                    price = crp.GetDecimal();
-
+                decimal price = ExtractLidlPrice(item);
                 if (price <= 0) continue;
-
                 var title = item.TryGetProperty("fullTitle", out var ft) ? ft.GetString() ?? query :
-                            item.TryGetProperty("name",      out var n)  ? n.GetString()  ?? query : query;
-                bool isPromo = item.TryGetProperty("isDiscount", out var isd) && isd.GetBoolean();
-
-                _logger.LogInformation("Lidl Plus {Country}: {Product} → €{Price}", country, title, price);
+                            item.TryGetProperty("name",      out var n)  ? n.GetString()  ?? query :
+                            item.TryGetProperty("title",     out var tt) ? tt.GetString() ?? query : query;
+                bool isPromo = item.TryGetProperty("isDiscount", out var isd) &&
+                               isd.ValueKind == JsonValueKind.True;
+                _logger.LogInformation("Lidl website {Country}: {Product} → €{Price}", country, title, price);
                 return new ScraperResult(title, price, true) { IsPromo = isPromo };
             }
         }
-        catch (Exception ex) { _logger.LogWarning(ex, "Lidl Plus API mislukt voor {Product}", query); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Lidl website API mislukt voor {Product}", query); }
         return new ScraperResult(query, 0, false);
     }
 
@@ -256,7 +255,7 @@ public class AldiScraper
         {
             // Aldi NL heeft een interne JSON search API
             var domain = country == "BE" ? "aldi.be" : "aldi.nl";
-            var url    = $"https://www.{domain}/api/search?q={Uri.EscapeDataString(query)}&pageSize=5";
+            var url    = $"https://www.{domain}/nl/zoeken.html?q={Uri.EscapeDataString(query)}";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
