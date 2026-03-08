@@ -80,14 +80,13 @@ public class LidlScraper
             // Verschillende Lidl response structuren proberen
             var root = doc.RootElement;
             JsonElement items;
-            bool hasItems = root.ValueKind == JsonValueKind.Array
-                ? (items = root, true)
-                : root.TryGetProperty("gridList",  out items) ||
-                  root.TryGetProperty("results",   out items) ||
-                  root.TryGetProperty("products",  out items) ||
-                  root.TryGetProperty("data",      out items);
-
-            if (!hasItems) return new ScraperResult(query, 0, false);
+            if (root.ValueKind == JsonValueKind.Array)
+                items = root;
+            else if (!root.TryGetProperty("gridList",  out items) &&
+                     !root.TryGetProperty("results",   out items) &&
+                     !root.TryGetProperty("products",  out items) &&
+                     !root.TryGetProperty("data",      out items))
+                return new ScraperResult(query, 0, false);
 
             foreach (var item in items.EnumerateArray())
             {
