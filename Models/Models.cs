@@ -135,6 +135,8 @@ namespace SmartShopper.API.Models
         public List<BulkSuggestion> BulkSuggestions { get; set; } = new();
         public List<CrossBorderSuggestion> CrossBorderSuggestions { get; set; } = new();
         public bool HasFallbackStores { get; set; } // true = geen Google Maps key
+        public string? Error { get; set; }           // foutmelding voor frontend
+        public bool InvalidLocation { get; set; }    // true = 0,0 ontvangen
     }
 
     public class BudgetWarning

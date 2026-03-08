@@ -69,6 +69,18 @@ public class CompareService
     {
         var result = new CompareResult();
 
+        // ─── 0. Valideer locatie — frontend stuurt soms 0,0 ─────────
+        bool invalidLocation = Math.Abs(request.UserLatitude) < 0.001
+                               && Math.Abs(request.UserLongitude) < 0.001;
+        if (invalidLocation)
+        {
+            _logger.LogWarning("Ongeldige locatie ontvangen: {Lat},{Lng} — locatietoegang geweigerd of GPS niet klaar",
+                request.UserLatitude, request.UserLongitude);
+            result.Error = "Locatie onbekend. Controleer of locatietoegang is toegestaan en probeer opnieuw.";
+            result.InvalidLocation = true;
+            return result;
+        }
+
         // ─── 1. Winkels ophalen ──────────────────────────────────────
         List<StoreTemplate> nearbyStores;
         bool hasMapsKey = !string.IsNullOrWhiteSpace(_mapsKey)
@@ -165,21 +177,12 @@ public class CompareService
     private async Task<StoreComparison> ScrapeSingleStoreAsync(StoreTemplate store, CompareRequest request)
     {
         var comparison = new StoreComparison { Store = store };
-
-        // ── Alle producten parallel scrapen per winkel ─────────────────
-        // Dit maakt de vergelijking 3-5x sneller dan sequential foreach.
-        var productTasks = request.Items.Select(item =>
-            GetMatchesWithCache(item, store.Chain, store.Country, request.AhBearerToken)
-                .ContinueWith(t => (item, matches: t.Result))
-        ).ToList();
-
-        var allResults = await Task.WhenAll(productTasks);
-
         decimal groceryTotal = 0;
         int preferenceMatches = 0;
 
-        foreach (var (item, matches) in allResults)
+        foreach (var item in request.Items)
         {
+            var matches = await GetMatchesWithCache(item, store.Chain, store.Country, request.AhBearerToken);
             var best = SelectBestMatch(matches, item, request.Preferences);
 
             var scraperResult = new ScraperResult(best.ProductName, best.Price, best.Price > 0)
@@ -252,8 +255,7 @@ public class CompareService
     private async Task<List<ProductMatch>> ScrapeForStore(
         GroceryItem item, string store, string country, string? ahToken)
     {
-        // Winkels met een eigen scraper → live data
-        var results = store switch
+        return store switch
         {
             "Albert Heijn"              => await _ahScraper.SearchProductAsync(item, ahToken),
             "Jumbo"                     => await _jumboScraper.SearchProductAsync(item),
@@ -264,33 +266,15 @@ public class CompareService
             "Edeka"                     => await _edekaScraper.SearchProductAsync(item),
             "Colruyt"                   => await _colruytScraper.SearchProductAsync(item),
             "Delhaize"                  => await _delhaizeScraper.SearchProductAsync(item),
-
-            // Ketens zonder eigen scraper: gebruik een vergelijkbare keten als proxy.
-            // Prijzen zijn SCHATTINGEN — altijd IsEstimated = true zetten.
-            "Netto" or "Kaufland"       => MarkAsEstimated(await _aldiScraper.SearchProductAsync(item, "DE"), store, country),
-            "Carrefour"                 => MarkAsEstimated(await _colruytScraper.SearchProductAsync(item), store, country),
+            // Ketens zonder eigen scraper: gebruik Aldi/Lidl als proxy (vergelijkbaar prijsniveau)
+            "Netto"                     => await _aldiScraper.SearchProductAsync(item, "DE"),
+            "Kaufland"                  => await _aldiScraper.SearchProductAsync(item, "DE"),
+            "Carrefour"                 => await _colruytScraper.SearchProductAsync(item),
             "Plus" or "Dirk"
                 or "Spar" or "Hoogvliet"
-                or "Coop"               => MarkAsEstimated(await _jumboScraper.SearchProductAsync(item), store, country),
-            _                           => (List<ProductMatch>)[]
+                or "Coop"               => await _jumboScraper.SearchProductAsync(item),
+            _                           => []
         };
-        return results;
-    }
-
-    /// <summary>
-    /// Overschrijft StoreName/Country en zet IsEstimated=true voor proxy-winkelresultaten.
-    /// Zorgt dat de UI een ~ toont naast de prijs.
-    /// </summary>
-    private static List<ProductMatch> MarkAsEstimated(List<ProductMatch> matches, string storeName, string country)
-    {
-        foreach (var m in matches)
-        {
-            m.StoreName    = storeName;
-            m.Country      = country;
-            m.IsEstimated  = true;
-            m.MatchConfidence = Math.Min(m.MatchConfidence, 0.60);
-        }
-        return matches;
     }
 
     // ─── Voorkeuren matching ─────────────────────────────────────────
@@ -417,71 +401,59 @@ public class CompareService
 
         try
         {
-            var url = $"{_supabaseUrl}/rest/v1/rpc/get_cross_border_savings";
+            var suggestions = new List<CrossBorderSuggestion>();
 
-            // Alle Supabase-queries parallel uitvoeren i.p.v. sequential
-            var tasks = items.Take(5).Select(item => FetchCrossBorderForItem(url, item));
-            var results = await Task.WhenAll(tasks);
+            foreach (var item in items.Take(5))
+            {
+                var url = $"{_supabaseUrl}/rest/v1/rpc/get_cross_border_savings";
+                using var req = new HttpRequestMessage(HttpMethod.Post, url);
+                req.Headers.TryAddWithoutValidation("apikey", _supabaseKey);
+                req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
+                req.Content = JsonContent.Create(new
+                {
+                    p_product_name = item.Name,
+                    p_min_savings_pct = 10,
+                    p_min_data_points = 3
+                });
 
-            return results
-                .SelectMany(r => r)
-                .OrderByDescending(s => s.SavingsPct)
-                .Take(3)
-                .ToList();
+                var response = await _http.SendAsync(req);
+                if (!response.IsSuccessStatusCode) continue;
+
+                var json = await response.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var row in doc.RootElement.EnumerateArray())
+                    {
+                        int savingsPct = row.TryGetProperty("savings_pct", out var sp) ? sp.GetInt32() : 0;
+                        if (savingsPct < 10) continue;
+
+                        string foreignCountry = row.TryGetProperty("cheapest_country", out var cc) ? cc.GetString() ?? "DE" : "DE";
+                        string flag = foreignCountry == "DE" ? "🇩🇪" : "🇧🇪";
+
+                        suggestions.Add(new CrossBorderSuggestion
+                        {
+                            ProductName = item.Name,
+                            NlPrice = row.TryGetProperty("nl_avg", out var nl) ? nl.GetDecimal() : 0,
+                            ForeignStore = row.TryGetProperty("cheapest_store", out var cs) ? cs.GetString() ?? "" : "",
+                            ForeignCountry = foreignCountry,
+                            ForeignPrice = row.TryGetProperty("foreign_avg", out var fa) ? fa.GetDecimal() : 0,
+                            SavingsPct = savingsPct,
+                            DataPoints = row.TryGetProperty("data_points", out var dp) ? dp.GetInt32() : 0,
+                            Tip = $"{flag} {item.Name} is gemiddeld {savingsPct}% goedkoper over de grens"
+                        });
+                    }
+                }
+            }
+
+            return suggestions.OrderByDescending(s => s.SavingsPct).Take(3).ToList();
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Cross-border suggesties ophalen mislukt");
             return [];
         }
-    }
-
-    private async Task<List<CrossBorderSuggestion>> FetchCrossBorderForItem(string url, GroceryItem item)
-    {
-        var suggestions = new List<CrossBorderSuggestion>();
-        try
-        {
-            using var req = new HttpRequestMessage(HttpMethod.Post, url);
-            req.Headers.TryAddWithoutValidation("apikey", _supabaseKey);
-            req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
-            req.Content = JsonContent.Create(new
-            {
-                p_product_name    = item.Name,
-                p_min_savings_pct = 10,
-                p_min_data_points = 3,
-            });
-
-            var response = await _http.SendAsync(req);
-            if (!response.IsSuccessStatusCode) return suggestions;
-
-            var json = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
-
-            if (doc.RootElement.ValueKind != JsonValueKind.Array) return suggestions;
-
-            foreach (var row in doc.RootElement.EnumerateArray())
-            {
-                int savingsPct = row.TryGetProperty("savings_pct", out var sp) ? sp.GetInt32() : 0;
-                if (savingsPct < 10) continue;
-
-                string foreignCountry = row.TryGetProperty("cheapest_country", out var cc) ? cc.GetString() ?? "DE" : "DE";
-                string flag = foreignCountry == "DE" ? "🇩🇪" : "🇧🇪";
-
-                suggestions.Add(new CrossBorderSuggestion
-                {
-                    ProductName    = item.Name,
-                    NlPrice        = row.TryGetProperty("nl_avg",         out var nl) ? nl.GetDecimal()      : 0,
-                    ForeignStore   = row.TryGetProperty("cheapest_store",  out var cs) ? cs.GetString() ?? "" : "",
-                    ForeignCountry = foreignCountry,
-                    ForeignPrice   = row.TryGetProperty("foreign_avg",    out var fa) ? fa.GetDecimal()      : 0,
-                    SavingsPct     = savingsPct,
-                    DataPoints     = row.TryGetProperty("data_points",    out var dp) ? dp.GetInt32()        : 0,
-                    Tip            = $"{flag} {item.Name} is gemiddeld {savingsPct}% goedkoper over de grens",
-                });
-            }
-        }
-        catch (Exception ex) { _logger.LogDebug(ex, "CrossBorder query mislukt voor {Product}", item.Name); }
-        return suggestions;
     }
 
     // ─── Open Food Facts fallback schatting ──────────────────────────
@@ -922,22 +894,20 @@ public class CompareService
         if (string.IsNullOrEmpty(_supabaseUrl)) return;
         try
         {
-            // Gebruik de geïnjecteerde _http (via IHttpClientFactory) i.p.v. new HttpClient().
-            // new HttpClient() per aanroep veroorzaakt socket exhaustion bij hoge load.
-            using var reqProduct = new HttpRequestMessage(
-                HttpMethod.Post,
-                $"{_supabaseUrl}/rest/v1/products?on_conflict=name");
-            reqProduct.Headers.TryAddWithoutValidation("apikey", _supabaseKey);
-            reqProduct.Headers.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
-            reqProduct.Headers.TryAddWithoutValidation("Prefer", "return=representation");
-            reqProduct.Content = JsonContent.Create(new
-            {
-                name = productName,
-                search_query = searchQuery,
-                updated_at = DateTime.UtcNow,
-            });
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Add("apikey", _supabaseKey);
+            client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+            client.DefaultRequestHeaders.Add("Prefer", "return=representation");
 
-            var productResp = await _http.SendAsync(reqProduct);
+            // Upsert product
+            var productResp = await client.PostAsJsonAsync(
+                $"{_supabaseUrl}/rest/v1/products?on_conflict=name", new
+                {
+                    name = productName,
+                    search_query = searchQuery,
+                    updated_at = DateTime.UtcNow,
+                });
+
             var productJson = await productResp.Content.ReadAsStringAsync();
             using var pdoc = JsonDocument.Parse(productJson);
             if (pdoc.RootElement.ValueKind != JsonValueKind.Array || pdoc.RootElement.GetArrayLength() == 0) return;
@@ -945,23 +915,18 @@ public class CompareService
             var productId = pdoc.RootElement[0].TryGetProperty("id", out var id) ? id.GetString() : null;
             if (string.IsNullOrEmpty(productId)) return;
 
-            using var reqPrice = new HttpRequestMessage(
-                HttpMethod.Post,
-                $"{_supabaseUrl}/rest/v1/prices?on_conflict=product_id,store,country");
-            reqPrice.Headers.TryAddWithoutValidation("apikey", _supabaseKey);
-            reqPrice.Headers.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
-            reqPrice.Content = JsonContent.Create(new
-            {
-                product_id = productId,
-                store,
-                country,
-                price,
-                is_promo = isPromo,
-                scraped_at = DateTime.UtcNow,
-                source = "live_scrape",
-            });
-
-            await _http.SendAsync(reqPrice);
+            // Upsert prijs (per dag uniek)
+            await client.PostAsJsonAsync(
+                $"{_supabaseUrl}/rest/v1/prices?on_conflict=product_id,store,country", new
+                {
+                    product_id = productId,
+                    store,
+                    country,
+                    price,
+                    is_promo = isPromo,
+                    scraped_at = DateTime.UtcNow,
+                    source = "live_scrape",
+                });
         }
         catch (Exception ex) { _logger.LogDebug(ex, "Supabase opslaan mislukt"); }
     }
@@ -972,9 +937,7 @@ public class CompareService
         // Nauwkeurige landgrenzen voor NL/BE/DE grensgebied
         // Getest met: Maastricht (50.85,5.69)=NL, Genk (50.96,5.50)=BE,
         //             Aachen (50.77,6.08)=DE, Hasselt (50.93,5.33)=BE,
-        //             Amsterdam (52.37,4.89)=NL, Antwerpen (51.22,4.40)=BE,
-        //             Luik/Liège (50.63,5.57)=BE, Namen/Namur (50.47,4.87)=BE,
-        //             Gent (51.05,3.72)=BE, Brugge (51.21,3.22)=BE
+        //             Amsterdam (52.37,4.89)=NL, Antwerpen (51.22,4.40)=BE
 
         // Midden/Noord NL
         if (lat >= 52.00 && lng >= 3.36 && lng <= 7.22) return "NL";
@@ -988,16 +951,12 @@ public class CompareService
         // Maastricht (50.85) = NL, Lanaken (50.88, lng 5.63) = BE
         if (lat >= 50.75 && lat < 51.30 && lng >= 5.50 && lng < 5.65)
             return lat >= 50.84 && lng >= 5.67 ? "NL" : "BE";
-        // Alles met lng < 5.50 en lat 50.75-51.30 = BE (Genk 5.50, Hasselt 5.33)
+        // Alles met lng < 5.50 en lat 50.75-51.30 = BE (Genk 5.50, Hasselt 5.33, Luik 5.57 maar lat 50.63)
         if (lat >= 50.75 && lat < 51.30 && lng >= 3.36 && lng < 5.50) return "BE";
         // Antwerpen regio BE
         if (lat >= 51.10 && lat < 51.30 && lng >= 3.36 && lng < 4.50) return "BE";
-        // Luik (50.63, 5.57) en omgeving — expliciet BE, valt anders door alle regels heen
-        if (lat >= 50.40 && lat < 50.75 && lng >= 4.50 && lng <= 6.40) return "BE";
-        // Diep België: Namen, Charleroi, Bergen, Waalse regio
+        // Diep belgie
         if (lat >= 49.50 && lat < 50.75 && lng >= 2.54 && lng <= 6.40) return "BE";
-        // Wallonië uiterst west (Moeskroen, Tournai)
-        if (lat >= 50.40 && lat < 50.75 && lng >= 2.54 && lng < 4.50) return "BE";
         return "NL";
     }
 
