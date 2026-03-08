@@ -7,10 +7,3 @@ healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
-
-[[services]]
-name = "smartshopper-api"
-
-[services.variables]
-ASPNETCORE_ENVIRONMENT = "Production"
-ASPNETCORE_URLS = "http://0.0.0.0:$PORT"
