@@ -1,5 +1,5 @@
 # ── Stage 1: build ──────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
 
 COPY *.csproj ./
@@ -14,10 +14,10 @@ RUN dotnet tool install --global Microsoft.Playwright.CLI && \
     playwright install chromium --with-deps || true
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 WORKDIR /app
 
-# Chromium system dependencies (nodig op Debian/Ubuntu)
+# Chromium system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
@@ -28,7 +28,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/publish .
-# Kopieer Playwright browsers (Chromium) van build stage naar runtime
 COPY --from=build /root/.cache/ms-playwright /root/.cache/ms-playwright
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
