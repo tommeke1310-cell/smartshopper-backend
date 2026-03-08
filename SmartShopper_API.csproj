@@ -16,6 +16,9 @@
 
     <!-- Swagger -->
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.9.0" />
+
+    <!-- Playwright: headless browser voor scraping -->
+    <PackageReference Include="Microsoft.Playwright" Version="1.44.0" />
   </ItemGroup>
 
 </Project>

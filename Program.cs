@@ -1,4 +1,5 @@
 using SmartShopper.API.Services;
+using System.Threading.RateLimiting;
 using SmartShopper.API.Services.Scrapers;
 using SmartShopper.API.Services.Routing;
 using Microsoft.Extensions.Http.Resilience;
@@ -140,13 +141,16 @@ builder.Services.AddMemoryCache();
 // ─── Rate Limiting (10 compare-requests/minuut per IP) ───────────
 builder.Services.AddRateLimiter(options =>
 {
-    options.AddFixedWindowLimiter("compare", o =>
-    {
-        o.Window = TimeSpan.FromMinutes(1);
-        o.PermitLimit = 10;
-        o.QueueLimit = 0;
-    });
     options.RejectionStatusCode = 429;
+    options.AddPolicy("compare", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "anon",
+            factory: _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                Window      = TimeSpan.FromMinutes(1),
+                PermitLimit = 10,
+                QueueLimit  = 0
+            }));
 });
 
 // ─── Logging ─────────────────────────────────────────────────────
