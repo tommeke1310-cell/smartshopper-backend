@@ -9,7 +9,6 @@ public class AlbertHeijnScraper
     private readonly HttpClient _http;
     private readonly ILogger<AlbertHeijnScraper> _logger;
 
-    // ah.nl/gql werkt met website-cookies sessie, geen IP-blokkade
     private const string AH_GQL_URL   = "https://www.ah.nl/gql";
     private const string AH_TOKEN_URL = "https://api.ah.nl/mobile-auth/v1/auth/token/anonymous";
 
@@ -21,7 +20,6 @@ public class AlbertHeijnScraper
     {
         _http   = http;
         _logger = logger;
-        // Website headers, niet mobile — werkt beter vanaf datacenter IPs
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
             "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "*/*");
@@ -37,9 +35,11 @@ public class AlbertHeijnScraper
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string? bearerToken = null)
     {
+        // Stap 1: Website GQL (best voor server-side rendering)
         var results = await TryWebGql(item);
         if (results.Count > 0) return results;
 
+        // Stap 2: Mobile API met bearer token
         results = await TryMobileApi(item, bearerToken);
         if (results.Count > 0) return results;
 
@@ -47,7 +47,7 @@ public class AlbertHeijnScraper
         return [];
     }
 
-    // ─── Website GQL (www.ah.nl/gql) — werkt zonder IP-blokkade ──
+    // ─── Website GQL (www.ah.nl/gql) ─────────────────────────────
     private async Task<List<ProductMatch>> TryWebGql(GroceryItem item)
     {
         try
@@ -62,10 +62,12 @@ public class AlbertHeijnScraper
                             brand { name }
                             price { now was }
                             discount { description }
+                            images { url }
+                            webUrl
                         }
                     }
                 }",
-                variables = new { query = item.Name, size = 5 }
+                variables = new { query = item.Name, size = 10 }
             };
 
             using var req = new HttpRequestMessage(HttpMethod.Post, AH_GQL_URL);
@@ -85,17 +87,33 @@ public class AlbertHeijnScraper
             if (!data.TryGetProperty("searchProducts", out var sp)) return [];
             if (!sp.TryGetProperty("products", out var products)) return [];
 
-            var results = new List<ProductMatch>();
+            var candidates = new List<ProductMatch>();
             foreach (var p in products.EnumerateArray())
             {
                 var match = ParseProduct(p, item.Name);
-                if (match != null) results.Add(match);
-                if (results.Count >= 3) break;
+                if (match != null) candidates.Add(match);
+                if (candidates.Count >= 10) break;
             }
 
-            _logger.LogInformation("AH GQL: {Count} resultaten voor '{Product}'",
-                results.Count, item.Name);
-            return results.OrderByDescending(r => r.MatchConfidence).Take(1).ToList();
+            if (candidates.Count == 0) return [];
+
+            // Selecteer beste match op basis van verbeterde score
+            var best = candidates
+                .OrderByDescending(r => r.MatchConfidence)
+                .FirstOrDefault();
+
+            if (best == null || !ProductMatcher.IsReliableMatch(best.MatchConfidence))
+            {
+                _logger.LogWarning("AH GQL: lage match-score ({Score:F2}) voor '{Product}'",
+                    best?.MatchConfidence ?? 0, item.Name);
+                // Geef toch terug maar markeer als onbetrouwbaar via lage score
+                if (best != null) return [best];
+                return [];
+            }
+
+            _logger.LogInformation("AH GQL: beste match '{Found}' (score {Score:F2}) voor '{Query}'",
+                best.ProductName, best.MatchConfidence, item.Name);
+            return [best];
         }
         catch (Exception ex)
         {
@@ -138,19 +156,26 @@ public class AlbertHeijnScraper
 
         return new ProductMatch
         {
-            StoreName       = "Albert Heijn", Country = "NL",
-            ProductName     = title, Price = price,
+            StoreName       = "Albert Heijn",
+            Country         = "NL",
+            ProductName     = title,
+            Price           = price,
             NormalPrice     = normalPrice > 0 ? normalPrice : price,
-            IsPromo = isPromo, PromoText = promoText, IsEstimated = false,
+            IsPromo         = isPromo,
+            PromoText       = promoText,
+            IsEstimated     = false,
             IsBiologisch    = title.Contains("biologisch", StringComparison.OrdinalIgnoreCase) ||
                               title.Contains(" bio ", StringComparison.OrdinalIgnoreCase),
             IsVegan         = title.Contains("vegan", StringComparison.OrdinalIgnoreCase),
-            IsHuisMerk      = isHuismerk, IsAMerk = !isHuismerk,
-            MatchConfidence = WordScore(query, title), LastUpdated = DateTime.UtcNow
+            IsHuisMerk      = isHuismerk,
+            IsAMerk         = !isHuismerk,
+            // Gebruik verbeterde ProductMatcher i.p.v. simpele WordScore
+            MatchConfidence = ProductMatcher.Score(query, title),
+            LastUpdated     = DateTime.UtcNow
         };
     }
 
-    // ─── Mobile API fallback (met anoniem token) ──────────────────
+    // ─── Mobile API fallback ──────────────────────────────────────
     private async Task<List<ProductMatch>> TryMobileApi(GroceryItem item, string? userToken)
     {
         try
@@ -160,7 +185,7 @@ public class AlbertHeijnScraper
 
             using var req = new HttpRequestMessage(HttpMethod.Get,
                 $"https://api.ah.nl/mobile-services/product/search/v2" +
-                $"?query={Uri.EscapeDataString(item.Name)}&size=5&sortBy=RELEVANCE");
+                $"?query={Uri.EscapeDataString(item.Name)}&size=10&sortBy=RELEVANCE");
             req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
             req.Headers.TryAddWithoutValidation("x-application", "appie");
 
@@ -171,24 +196,38 @@ public class AlbertHeijnScraper
             using var doc = JsonDocument.Parse(json);
             if (!doc.RootElement.TryGetProperty("products", out var products)) return [];
 
+            var candidates = new List<ProductMatch>();
             foreach (var p in products.EnumerateArray())
             {
                 var title = p.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
                 if (string.IsNullOrEmpty(title)) continue;
+
                 decimal price = 0;
                 if (p.TryGetProperty("price", out var pr))
                     price = pr.TryGetProperty("now", out var now) ? now.GetDecimal() :
                             pr.TryGetProperty("unitPrice", out var up) ? up.GetDecimal() : 0;
                 if (price <= 0) continue;
-                _logger.LogInformation("AH Mobile: {Product} → €{Price}", title, price);
-                return [new ProductMatch
+
+                candidates.Add(new ProductMatch
                 {
-                    StoreName = "Albert Heijn", Country = "NL",
-                    ProductName = title, Price = price, NormalPrice = price,
-                    IsEstimated = false, MatchConfidence = WordScore(item.Name, title),
-                    LastUpdated = DateTime.UtcNow
-                }];
+                    StoreName       = "Albert Heijn",
+                    Country         = "NL",
+                    ProductName     = title,
+                    Price           = price,
+                    NormalPrice     = price,
+                    IsEstimated     = false,
+                    MatchConfidence = ProductMatcher.Score(item.Name, title),
+                    LastUpdated     = DateTime.UtcNow
+                });
+                if (candidates.Count >= 10) break;
             }
+
+            if (candidates.Count == 0) return [];
+
+            var best = candidates.OrderByDescending(c => c.MatchConfidence).First();
+            _logger.LogInformation("AH Mobile: '{Found}' (score {Score:F2}) voor '{Query}'",
+                best.ProductName, best.MatchConfidence, item.Name);
+            return [best];
         }
         catch (Exception ex)
         {
@@ -241,14 +280,6 @@ public class AlbertHeijnScraper
             return doc.RootElement.TryGetProperty("access_token", out var at) ? at.GetString() : null;
         }
         catch { return null; }
-    }
-
-    private static double WordScore(string query, string product)
-    {
-        var words = query.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0;
-        var lower = product.ToLower();
-        return (double)words.Count(w => lower.Contains(w)) / words.Length;
     }
 }
 

@@ -18,17 +18,25 @@ public class ColruytScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-BE,nl;q=0.9");
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item)
     {
-        var result = await TryColruytApi(item.Name);
+        // Stap 1: Colruyt publieke catalog API (meest stabiel)
+        var result = await TryColruytCatalogApi(item.Name);
+
+        // Stap 2: Legacy ECG endpoint (was soms geblokkeerd)
+        if (result == null) result = await TryColruytLegacyApi(item.Name);
+
+        // Stap 3: HTML fallback
         if (result == null) result = await TryColruytHtml(item.Name);
+
         if (result == null) return [];
 
+        var score = ProductMatcher.Score(item.Name, result.ProductName);
         bool isBio   = result.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
                        result.ProductName.Contains("biologisch", StringComparison.OrdinalIgnoreCase);
         bool isVegan = result.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase);
@@ -41,54 +49,119 @@ public class ColruytScraper
             Price           = result.Price,
             IsPromo         = result.IsPromo,
             IsEstimated     = false,
-            MatchConfidence = WordScore(item.Name, result.ProductName),
+            MatchConfidence = score,
             IsBiologisch    = isBio,
             IsVegan         = isVegan,
-            IsHuisMerk      = result.ProductName.Contains("Boni", StringComparison.OrdinalIgnoreCase),
+            IsHuisMerk      = result.ProductName.Contains("Boni", StringComparison.OrdinalIgnoreCase) ||
+                              result.ProductName.Contains("ColruytBest", StringComparison.OrdinalIgnoreCase),
             IsAMerk         = !result.ProductName.Contains("Boni", StringComparison.OrdinalIgnoreCase),
         }];
     }
 
-    private async Task<ScraperResult?> TryColruytApi(string query)
+    // ─── Colruyt publieke catalog API ────────────────────────────
+    private async Task<ScraperResult?> TryColruytCatalogApi(string query)
     {
         try
         {
-            // Colruyt gebruikt een interne product search API
-            var url = $"https://ecg.colruyt.be/PRODUITS/services/searchProducts" +
-                      $"?searchTerm={Uri.EscapeDataString(query)}&start=0&count=5&site=Colruyt";
+            // Colruyt gebruikt een publiek toegankelijke catalog search
+            var url = $"https://www.colruyt.be/colruytAPI/api/products" +
+                      $"?text={Uri.EscapeDataString(query)}&placeId=&site=colruyt&language=NL&count=10";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("Referer", "https://www.colruyt.be/");
+            req.Headers.TryAddWithoutValidation("Referer",           "https://www.colruyt.be/");
             req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
+            req.Headers.TryAddWithoutValidation("Origin",            "https://www.colruyt.be");
 
             var response = await _http.SendAsync(req);
             if (!response.IsSuccessStatusCode) return null;
 
             var json = await response.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(json)) return null;
+
             using var doc = JsonDocument.Parse(json);
 
             // Probeer verschillende response structuren
             JsonElement products = default;
-            if (doc.RootElement.TryGetProperty("products", out products) ||
+            bool found =
+                doc.RootElement.TryGetProperty("products", out products) ||
                 doc.RootElement.TryGetProperty("data",     out products) ||
-                doc.RootElement.TryGetProperty("items",    out products))
+                doc.RootElement.TryGetProperty("items",    out products);
+
+            if (!found || products.ValueKind != JsonValueKind.Array) return null;
+
+            return FindBestColruytMatch(products, query, "Colruyt catalog");
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Colruyt catalog API mislukt voor {Product}", query); }
+        return null;
+    }
+
+    // ─── Legacy ECG endpoint ─────────────────────────────────────
+    private async Task<ScraperResult?> TryColruytLegacyApi(string query)
+    {
+        try
+        {
+            var urls = new[]
             {
-                foreach (var p in products.EnumerateArray())
+                $"https://ecg.colruyt.be/PRODUITS/services/searchProducts?searchTerm={Uri.EscapeDataString(query)}&start=0&count=10&site=Colruyt",
+                $"https://www.colruyt.be/colruytAPI/api/v2/products?text={Uri.EscapeDataString(query)}&count=10",
+            };
+
+            foreach (var url in urls)
+            {
+                try
                 {
-                    decimal price = ExtractPrice(p, ["price", "basicPrice", "currentPrice", "recommendedPrice"]);
-                    if (price <= 0) continue;
+                    using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                    req.Headers.TryAddWithoutValidation("Referer", "https://www.colruyt.be/");
 
-                    var name = GetString(p, ["name", "title", "description"]) ?? query;
-                    bool isPromo = p.TryGetProperty("promotion", out _) ||
-                                   p.TryGetProperty("isPromo",   out _);
+                    var response = await _http.SendAsync(req);
+                    if (!response.IsSuccessStatusCode) continue;
 
-                    _logger.LogInformation("Colruyt BE: {Product} → €{Price}", name, price);
-                    return new ScraperResult(name, price, true) { IsPromo = isPromo };
+                    var json = await response.Content.ReadAsStringAsync();
+                    if (string.IsNullOrWhiteSpace(json)) continue;
+
+                    using var doc = JsonDocument.Parse(json);
+
+                    JsonElement products = default;
+                    bool found =
+                        doc.RootElement.TryGetProperty("products", out products) ||
+                        doc.RootElement.TryGetProperty("data",     out products) ||
+                        doc.RootElement.TryGetProperty("items",    out products);
+
+                    if (!found || products.ValueKind != JsonValueKind.Array) continue;
+
+                    var result = FindBestColruytMatch(products, query, "Colruyt legacy");
+                    if (result != null) return result;
                 }
+                catch { /* probeer volgende */ }
             }
         }
-        catch (Exception ex) { _logger.LogWarning(ex, "Colruyt API mislukt voor {Product}", query); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Colruyt legacy API mislukt voor {Product}", query); }
         return null;
+    }
+
+    private ScraperResult? FindBestColruytMatch(JsonElement products, string query, string source)
+    {
+        var candidates = new List<(string Name, decimal Price, bool IsPromo, double Score)>();
+
+        foreach (var p in products.EnumerateArray())
+        {
+            decimal price = ExtractPrice(p, ["price", "basicPrice", "currentPrice", "recommendedPrice", "normalPrice"]);
+            if (price <= 0) continue;
+
+            var name = GetString(p, ["name", "title", "description"]) ?? query;
+            bool isPromo = p.TryGetProperty("promotion", out _) || p.TryGetProperty("isPromo", out _);
+            var score = ProductMatcher.Score(query, name);
+
+            candidates.Add((name, price, isPromo, score));
+        }
+
+        if (candidates.Count == 0) return null;
+
+        var best = candidates.OrderByDescending(c => c.Score).First();
+        _logger.LogInformation("{Source}: '{Name}' €{Price} (score {Score:F2}) voor '{Query}'",
+            source, best.Name, best.Price, best.Score, query);
+
+        return new ScraperResult(best.Name, best.Price, true) { IsPromo = best.IsPromo };
     }
 
     private async Task<ScraperResult?> TryColruytHtml(string query)
@@ -102,7 +175,6 @@ public class ColruytScraper
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
 
-            // Colruyt prijs selectors
             string[] selectors =
             [
                 "//span[contains(@class,'product-price__price')]",
@@ -110,6 +182,7 @@ public class ColruytScraper
                 "//p[contains(@class,'price')]",
                 "//*[@data-testid='product-price']",
                 "//meta[@itemprop='price']",
+                "//span[contains(@class,'price') and not(contains(@class,'old'))]",
             ];
 
             foreach (var sel in selectors)
@@ -120,7 +193,7 @@ public class ColruytScraper
                 var m   = System.Text.RegularExpressions.Regex.Match(raw.Replace(",", "."), @"\d+\.\d{2}");
                 if (m.Success && decimal.TryParse(m.Value, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p) && p > 0)
                 {
-                    _logger.LogInformation("Colruyt HTML BE: {Product} → €{Price}", query, p);
+                    _logger.LogInformation("Colruyt HTML: {Product} → €{Price}", query, p);
                     return new ScraperResult(query, p, true);
                 }
             }
@@ -152,13 +225,6 @@ public class ColruytScraper
                 return v.GetString();
         return null;
     }
-
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0.65;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -174,7 +240,7 @@ public class DelhaizeScraper
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-BE,nl;q=0.9");
     }
@@ -182,9 +248,11 @@ public class DelhaizeScraper
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item)
     {
         var result = await TryDelhaizeApi(item.Name);
+        if (result == null) result = await TryDelhaizeAlternativeApi(item.Name);
         if (result == null) result = await TryDelhaizeHtml(item.Name);
         if (result == null) return [];
 
+        var score = ProductMatcher.Score(item.Name, result.ProductName);
         bool isBio   = result.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
                        result.ProductName.Contains("biologisch", StringComparison.OrdinalIgnoreCase);
         bool isVegan = result.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase);
@@ -197,10 +265,11 @@ public class DelhaizeScraper
             Price           = result.Price,
             IsPromo         = result.IsPromo,
             IsEstimated     = false,
-            MatchConfidence = WordScore(item.Name, result.ProductName),
+            MatchConfidence = score,
             IsBiologisch    = isBio,
             IsVegan         = isVegan,
-            IsHuisMerk      = result.ProductName.Contains("365", StringComparison.OrdinalIgnoreCase),
+            IsHuisMerk      = result.ProductName.Contains("365", StringComparison.OrdinalIgnoreCase) ||
+                              result.ProductName.Contains("Delhaize", StringComparison.OrdinalIgnoreCase),
             IsAMerk         = !result.ProductName.Contains("365", StringComparison.OrdinalIgnoreCase),
         }];
     }
@@ -209,9 +278,9 @@ public class DelhaizeScraper
     {
         try
         {
-            // Delhaize gebruikt de Okta-beveiligde shop API — probeer publieke zoek endpoint
+            // Primaire Delhaize API
             var url = $"https://www.delhaize.be/api/v2/search?q={Uri.EscapeDataString(query)}" +
-                      $"&pageSize=5&currentPage=0&lang=nl";
+                      $"&pageSize=10&currentPage=0&lang=nl&fields=FULL";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Referer", "https://www.delhaize.be/");
@@ -228,36 +297,80 @@ public class DelhaizeScraper
                          doc.RootElement.TryGetProperty("searchResults",  out products);
             if (!found) return null;
 
-            foreach (var p in products.EnumerateArray())
-            {
-                decimal price = TryGetDelhaizePrice(p);
-                if (price <= 0) continue;
-
-                var name = (p.TryGetProperty("name",  out var n) ? n.GetString() : null) ??
-                           (p.TryGetProperty("title", out var t) ? t.GetString() : null) ?? query;
-
-                bool isPromo = p.TryGetProperty("discountedPrice", out _) ||
-                               p.TryGetProperty("promotionPrice",  out _);
-
-                _logger.LogInformation("Delhaize BE: {Product} → €{Price}", name, price);
-                return new ScraperResult(name, price, true) { IsPromo = isPromo };
-            }
+            return FindBestDelhaizeMatch(products, query, "Delhaize API");
         }
         catch (Exception ex) { _logger.LogWarning(ex, "Delhaize API mislukt voor {Product}", query); }
         return null;
     }
 
+    private async Task<ScraperResult?> TryDelhaizeAlternativeApi(string query)
+    {
+        try
+        {
+            // Alternatief: Delhaize GraphQL of andere publieke endpoint
+            var url = $"https://www.delhaize.be/nl-be/search?text={Uri.EscapeDataString(query)}&format=json";
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("Referer",     "https://www.delhaize.be/");
+            req.Headers.TryAddWithoutValidation("Accept",      "application/json");
+
+            var response = await _http.SendAsync(req);
+            if (!response.IsSuccessStatusCode) return null;
+
+            var json = await response.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(json) || json.TrimStart()[0] != '{') return null;
+
+            using var doc = JsonDocument.Parse(json);
+
+            JsonElement products = default;
+            bool found = doc.RootElement.TryGetProperty("products",  out products) ||
+                         doc.RootElement.TryGetProperty("results",   out products) ||
+                         doc.RootElement.TryGetProperty("data",      out products);
+            if (!found) return null;
+
+            return FindBestDelhaizeMatch(products, query, "Delhaize alt API");
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Delhaize alt API mislukt voor {Product}", query); }
+        return null;
+    }
+
+    private ScraperResult? FindBestDelhaizeMatch(JsonElement products, string query, string source)
+    {
+        var candidates = new List<(string Name, decimal Price, bool IsPromo, double Score)>();
+
+        foreach (var p in products.EnumerateArray())
+        {
+            decimal price = TryGetDelhaizePrice(p);
+            if (price <= 0) continue;
+
+            var name = (p.TryGetProperty("name",  out var n) ? n.GetString() : null) ??
+                       (p.TryGetProperty("title", out var t) ? t.GetString() : null) ?? query;
+
+            bool isPromo = p.TryGetProperty("discountedPrice", out _) ||
+                           p.TryGetProperty("promotionPrice",  out _);
+
+            candidates.Add((name, price, isPromo, ProductMatcher.Score(query, name)));
+        }
+
+        if (candidates.Count == 0) return null;
+
+        var best = candidates.OrderByDescending(c => c.Score).First();
+        _logger.LogInformation("{Source}: '{Name}' €{Price} (score {Score:F2}) voor '{Query}'",
+            source, best.Name, best.Price, best.Score, query);
+
+        return new ScraperResult(best.Name, best.Price, true) { IsPromo = best.IsPromo };
+    }
+
     private static decimal TryGetDelhaizePrice(JsonElement p)
     {
-        // Delhaize kan price op meerdere niveaus hebben
-        string[] priceKeys = ["price", "currentPrice", "normalPrice", "priceValue"];
+        string[] priceKeys = ["price", "currentPrice", "normalPrice", "priceValue", "value"];
         foreach (var key in priceKeys)
         {
             if (!p.TryGetProperty(key, out var v)) continue;
             if (v.ValueKind == JsonValueKind.Number) return v.GetDecimal();
             if (v.ValueKind == JsonValueKind.Object)
             {
-                if (v.TryGetProperty("value",        out var val)) return val.GetDecimal();
+                if (v.TryGetProperty("value",          out var val)) return val.GetDecimal();
                 if (v.TryGetProperty("formattedValue", out var fv))
                 {
                     var s = fv.GetString()?.Replace("€", "").Replace(",", ".").Trim();
@@ -296,19 +409,12 @@ public class DelhaizeScraper
                 var m   = System.Text.RegularExpressions.Regex.Match(raw.Replace(",", "."), @"\d+\.\d{2}");
                 if (m.Success && decimal.TryParse(m.Value, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p) && p > 0)
                 {
-                    _logger.LogInformation("Delhaize HTML BE: {Product} → €{Price}", query, p);
+                    _logger.LogInformation("Delhaize HTML: {Product} → €{Price}", query, p);
                     return new ScraperResult(query, p, true);
                 }
             }
         }
         catch (Exception ex) { _logger.LogError(ex, "Delhaize HTML fout voor {Product}", query); }
         return null;
-    }
-
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0.65;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
     }
 }
