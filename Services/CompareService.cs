@@ -245,20 +245,30 @@ public class CompareService
     {
         try
         {
+            // ── Generieke zoekterm: strip winkelmerk-prefix ───────────────
+            // "AH rundergehakt 500g" → "rundergehakt"  (zoekterm voor Jumbo/Lidl/etc.)
+            // "Coca-Cola Zero"       → "Coca-Cola Zero" (A-merk blijft intact)
+            var genericItem = new GroceryItem
+            {
+                Name     = ProductMatcher.GenericSearchName(item.Name),
+                Quantity = item.Quantity,
+                Unit     = item.Unit,
+            };
+
             List<ProductMatch> matches = (store.Chain, store.Country) switch
             {
-                ("Albert Heijn", _)    => await _ah.SearchProductAsync(item, ahToken),
-                ("Jumbo",        _)    => await _jumbo.SearchProductAsync(item),
-                ("Lidl",         "BE") => await _lidl.SearchProductAsync(item, "BE"),
-                ("Lidl",         "DE") => await _lidl.SearchProductAsync(item, "DE"),
-                ("Lidl",         _)    => await _lidl.SearchProductAsync(item, "NL"),
-                ("Aldi",         "BE") => await _aldi.SearchProductAsync(item, "BE"),
-                ("Aldi Süd",     "DE") => await _aldi.SearchProductAsync(item, "DE"),
-                ("Aldi",         _)    => await _aldi.SearchProductAsync(item, "NL"),
-                ("Colruyt",      _)    => await _colruyt.SearchProductAsync(item),
-                ("Delhaize",     _)    => await _delhaize.SearchProductAsync(item),
-                ("Rewe",         _)    => await _rewe.SearchProductAsync(item),
-                ("Edeka",        _)    => await _edeka.SearchProductAsync(item),
+                ("Albert Heijn", _)    => await _ah.SearchProductAsync(genericItem, ahToken),
+                ("Jumbo",        _)    => await _jumbo.SearchProductAsync(genericItem),
+                ("Lidl",         "BE") => await _lidl.SearchProductAsync(genericItem, "BE"),
+                ("Lidl",         "DE") => await _lidl.SearchProductAsync(genericItem, "DE"),
+                ("Lidl",         _)    => await _lidl.SearchProductAsync(genericItem, "NL"),
+                ("Aldi",         "BE") => await _aldi.SearchProductAsync(genericItem, "BE"),
+                ("Aldi Süd",     "DE") => await _aldi.SearchProductAsync(genericItem, "DE"),
+                ("Aldi",         _)    => await _aldi.SearchProductAsync(genericItem, "NL"),
+                ("Colruyt",      _)    => await _colruyt.SearchProductAsync(genericItem),
+                ("Delhaize",     _)    => await _delhaize.SearchProductAsync(genericItem),
+                ("Rewe",         _)    => await _rewe.SearchProductAsync(genericItem),
+                ("Edeka",        _)    => await _edeka.SearchProductAsync(genericItem),
                 _                     => [],
             };
 
@@ -266,10 +276,13 @@ public class CompareService
             if (best == null || best.Price <= 0)
                 return new ScraperResult(item.Name, 0, false) { IsEstimated = false };
 
-            return new ScraperResult(best.ProductName, best.Price, true)
+            // Gebruik de ORIGINELE item.Name als productnaam in de UI
+            // zodat "AH rundergehakt 500g" → "rundergehakt" bij alle winkels consistent heet
+            return new ScraperResult(item.Name, best.Price, true)
             {
-                IsPromo     = best.IsPromo,
-                IsEstimated = best.IsEstimated,
+                IsPromo       = best.IsPromo,
+                IsEstimated   = best.IsEstimated,
+                FoundName     = best.ProductName, // werkelijke gevonden naam (optioneel tonen)
             };
         }
         catch (Exception ex)

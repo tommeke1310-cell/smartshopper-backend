@@ -101,6 +101,7 @@ namespace SmartShopper.API.Models
         public bool Success { get; set; }
         public bool IsPromo { get; set; }
         public bool IsEstimated { get; set; }
+        public string? FoundName { get; set; }  // Werkelijke gevonden naam bij de winkel
         public string? Name => ProductName;
 
         public ScraperResult(string productName, decimal price, bool success)

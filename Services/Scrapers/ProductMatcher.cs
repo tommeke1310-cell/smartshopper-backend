@@ -3,11 +3,23 @@ using System.Text.RegularExpressions;
 namespace SmartShopper.API.Services.Scrapers;
 
 /// <summary>
-/// Gedeelde helper voor product-match scoring en hoeveelheid-normalisatie.
-/// Zorgt dat alle scrapers op dezelfde manier vergelijken → nauwkeurigere prijsvergelijking.
+/// Gedeelde helper voor product-match scoring en generieke naam extractie.
+/// Zorgt dat "AH rundergehakt 500g" en "Jumbo rundergehakt" en "Lidl rundergehakt"
+/// allemaal als hetzelfde product worden herkend — zodat winkels eerlijk vergeleken worden.
 /// </summary>
 public static class ProductMatcher
 {
+    // ─── Winkelmerk-prefixen die weggestript worden ────────────────
+    // "AH rundergehakt" → "rundergehakt"
+    // "Jumbo halfvolle melk" → "halfvolle melk"
+    private static readonly string[] StorePrefixes =
+    [
+        "albert heijn", "ah ", "jumbo", "lidl", "aldi", "plus",
+        "dirk", "spar", "action", "kruidvat", "colruyt", "delhaize",
+        "carrefour", "rewe", "edeka", "kaufland", "netto",
+        "dagvers",
+    ];
+
     // ─── Synoniemen voor veelgebruikte productnamen ────────────────
     private static readonly Dictionary<string, string[]> Synonyms = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -20,7 +32,8 @@ public static class ProductMatcher
         ["tomaat"]      = ["tomato", "tomate", "tomaten"],
         ["kip"]         = ["chicken", "poulet", "hähnchen", "kipfilet"],
         ["varkens"]     = ["pork", "porc", "schwein"],
-        ["rund"]        = ["beef", "boeuf", "rind"],
+        ["rund"]        = ["beef", "boeuf", "rind", "runder", "rundergehakt"],
+        ["gehakt"]      = ["hackfleisch", "haché", "mince", "rundergehakt", "half-om-half"],
         ["cola"]        = ["coca cola", "coca-cola", "coke"],
         ["water"]       = ["spa", "mineraalwater", "bronwater"],
         ["sinaasappel"] = ["orange", "sinas", "jus d'orange"],
@@ -42,8 +55,50 @@ public static class ProductMatcher
     };
 
     /// <summary>
+    /// Verwijdert winkelnamen en merkprefixen uit een productnaam.
+    /// "AH rundergehakt 500g" → "rundergehakt 500g"
+    /// "Jumbo halfvolle melk 1L" → "halfvolle melk 1L"
+    /// </summary>
+    public static string StripStoreBrand(string name)
+    {
+        var lower = name.ToLowerInvariant().Trim();
+        foreach (var prefix in StorePrefixes)
+        {
+            if (lower.StartsWith(prefix.TrimEnd()))
+            {
+                // Verwijder het prefix + eventuele spatie erna
+                var trimmed = name.Substring(prefix.TrimEnd().Length).TrimStart();
+                if (trimmed.Length > 2) return trimmed;
+            }
+        }
+        return name;
+    }
+
+    /// <summary>
+    /// Geeft de generieke productnaam terug: strip winkelmerk + normaliseer.
+    /// Gebruik dit als zoekterm bij andere scrapers.
+    /// "AH rundergehakt 500g" → "rundergehakt"
+    /// "Coca-Cola Zero 6-pack" → "Coca-Cola Zero" (A-merk bewaard)
+    /// </summary>
+    public static string GenericSearchName(string name)
+    {
+        // 1. Strip winkelmerk-prefix
+        var stripped = StripStoreBrand(name);
+
+        // 2. Normaliseer
+        var normalized = Normalize(stripped);
+
+        // 3. Haal keywords op (hoeveelheden/eenheden worden genegeerd bij zoeken)
+        var keywords = GetKeywords(normalized);
+
+        // Geef de keywords terug als zoekopdracht (max 4 woorden voor beste resultaten)
+        return keywords.Length > 0
+            ? string.Join(" ", keywords.Take(4))
+            : stripped;
+    }
+
+    /// <summary>
     /// Berekent een nauwkeurige match-score tussen zoekopdracht en productnaam.
-    /// Houdt rekening met synoniemen, hoeveelheden en stopwoorden.
     /// Score 0.0–1.0, hoger = betere match.
     /// </summary>
     public static double Score(string query, string productName)
@@ -60,7 +115,7 @@ public static class ProductMatcher
         // Product bevat volledige query
         if (p.Contains(q)) return 0.95;
 
-        // Query bevat volledige productnaam (product is subsetvan query)
+        // Query bevat volledige productnaam
         if (q.Contains(p)) return 0.90;
 
         var qWords = GetKeywords(q);
@@ -68,43 +123,35 @@ public static class ProductMatcher
 
         if (qWords.Length == 0) return 0;
 
-        // Tel directe treffers
         int hits = 0;
-        var unmatchedQ = new List<string>();
-
         foreach (var qw in qWords)
         {
             bool matched = pWords.Any(pw => pw == qw || pw.Contains(qw) || qw.Contains(pw));
 
-            // Check synoniemen als geen directe hit
             if (!matched && Synonyms.TryGetValue(qw, out var syns))
                 matched = syns.Any(s => p.Contains(s));
 
+            // Omgekeerde synonymen-check
+            if (!matched)
+                matched = Synonyms.Any(kv =>
+                    kv.Value.Contains(qw, StringComparer.OrdinalIgnoreCase) &&
+                    (p.Contains(kv.Key) || pWords.Any(pw => pw == kv.Key)));
+
             if (matched) hits++;
-            else unmatchedQ.Add(qw);
         }
 
         double baseScore = (double)hits / qWords.Length;
 
-        // Bonus: als alle relevante querywoorden matchen
         if (hits == qWords.Length) baseScore = Math.Min(1.0, baseScore + 0.1);
 
-        // Kleine straf voor ongematchte woorden in product
-        // (product is te specifiek of ander merk/type)
         int extraPWords = pWords.Count(pw => !qWords.Any(qw => qw == pw || pw.Contains(qw)));
         if (extraPWords > 2) baseScore *= 0.85;
 
         return Math.Round(baseScore, 3);
     }
 
-    /// <summary>
-    /// Geeft true als de score hoog genoeg is voor een betrouwbare vergelijking.
-    /// </summary>
-    public static bool IsReliableMatch(double score) => score >= 0.60;
+    public static bool IsReliableMatch(double score) => score >= 0.55;
 
-    /// <summary>
-    /// Normaliseert productnaam voor vergelijking (lowercase, diacritics weg, etc.)
-    /// </summary>
     public static string Normalize(string input)
     {
         return input.ToLowerInvariant()
