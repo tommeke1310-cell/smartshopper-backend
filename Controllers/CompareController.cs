@@ -33,8 +33,8 @@ public class CompareController : ControllerBase
         {
             UserId = dto.UserId ?? "",
             Items = dto.Items,
-            UserLatitude = dto.Lat,
-            UserLongitude = dto.Lng,
+            UserLatitude = dto.UserLatitude != 0 ? dto.UserLatitude : dto.Lat,
+            UserLongitude = dto.UserLongitude != 0 ? dto.UserLongitude : dto.Lng,
             MaxDistanceKm = dto.MaxDistanceKm > 0 ? dto.MaxDistanceKm : 50,
             IncludeGermany = dto.IncludeGermany,
             IncludeBelgium = dto.IncludeBelgium,
@@ -155,8 +155,10 @@ public class CompareRequestDto
 {
     public string? UserId { get; set; }
     public List<GroceryItem> Items { get; set; } = new();
-    public double Lat { get; set; }
-    public double Lng { get; set; }
+    public double Lat { get; set; }           // legacy
+    public double Lng { get; set; }           // legacy
+    public double UserLatitude { get; set; }  // nieuwe naam app
+    public double UserLongitude { get; set; } // nieuwe naam app
     public int MaxDistanceKm { get; set; } = 50;
     public bool IncludeGermany { get; set; } = true;
     public bool IncludeBelgium { get; set; } = true;
