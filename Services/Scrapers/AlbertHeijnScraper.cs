@@ -1,17 +1,16 @@
 using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using SmartShopper.API.Models;
 
 namespace SmartShopper.API.Services.Scrapers;
 
 /// <summary>
 /// AH scraper via HTML-parsing van Apollo SSR data.
-/// De AH GQL API en Mobile API blokkeren datacenter-IPs (Railway).
-/// De website (www.ah.nl/zoeken?query=...) servert Apollo SSR data in een script-tag,
-/// die altijd beschikbaar is zonder API-sleutels of IP-whitelisting.
-/// Echte prijs zit in: priceV2.now.amount (niet price.now)
+/// De AH GQL/Mobile API blokkeren Railway datacenter-IPs.
+/// www.ah.nl/zoeken servert productdata in een Apollo SSR script-tag
+/// die altijd beschikbaar is zonder API-sleutels.
+/// Extractiemethode: accolade-balancering (Regex werkt niet voor geneste JSON).
+/// Prijsveld: priceV2.now.amount (niet het oude price.now)
 /// </summary>
 public class AlbertHeijnScraper
 {
@@ -30,7 +29,7 @@ public class AlbertHeijnScraper
         _http   = http;
         _logger = logger;
 
-        // Browser-headers zodat www.ah.nl niet blokkeert
+        // Browser-headers om niet geblokkeerd te worden door Cloudflare/AH
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
@@ -45,11 +44,11 @@ public class AlbertHeijnScraper
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string? bearerToken = null)
     {
-        // 1. HTML scrapen via Apollo SSR (altijd beschikbaar)
+        // 1. HTML + Apollo SSR (altijd beschikbaar, ook van datacenter IP)
         var results = await TryHtmlScrape(item);
         if (results.Count > 0) return results;
 
-        // 2. Mobile API fallback
+        // 2. Mobile API fallback (soms geblokkeerd van server)
         results = await TryMobileApi(item, bearerToken);
         if (results.Count > 0) return results;
 
@@ -57,7 +56,7 @@ public class AlbertHeijnScraper
         return [];
     }
 
-    // ─── Methode 1: HTML-pagina scrapen + Apollo SSR data ─────────
+    // ─── Methode 1: HTML scrapen + Apollo SSR data ─────────────────
     private async Task<List<ProductMatch>> TryHtmlScrape(GroceryItem item)
     {
         try
@@ -72,45 +71,74 @@ public class AlbertHeijnScraper
             }
 
             var html = await response.Content.ReadAsStringAsync();
-            var products = ParseApolloSsr(html, item.Name);
+            var products = ExtractApolloProducts(html, item.Name);
 
             _logger.LogInformation("AH HTML: {Count} resultaten voor '{Product}'", products.Count, item.Name);
             return products;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "AH HTML scrape mislukt voor '{Product}'", item.Name);
+            _logger.LogWarning(ex, "AH HTML mislukt voor '{Product}'", item.Name);
             return [];
         }
     }
 
-    // ─── Apollo SSR parser ─────────────────────────────────────────
+    // ─── Apollo SSR extractor met accolade-balancering ─────────────
     // AH injecteert data als:
-    //   (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({"rehydrate":{...}})
-    // De JSON bevat searchProducts -> products[] met priceV2.now.amount
-    private List<ProductMatch> ParseApolloSsr(string html, string query)
+    //   (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({...grote JSON...});
+    // Regex werkt niet voor geneste JSON — gebruik accolade-balancering.
+    // Data zit in: rehydrate[key].data.searchProducts.products[].priceV2.now.amount
+    private List<ProductMatch> ExtractApolloProducts(string html, string query)
     {
-        var results = new List<ProductMatch>();
+        const string MARKER = "ApolloSSRDataTransport";
+        int searchFrom = 0;
 
-        var regex = new Regex(
-            @"\(window\[Symbol\.for\(""ApolloSSRDataTransport""\)\][^)]*\)\.push\((\{.+?\})\);",
-            RegexOptions.Singleline);
-
-        foreach (Match m in regex.Matches(html))
+        while (true)
         {
+            // Vind de volgende Apollo push
+            int markerIdx = html.IndexOf(MARKER, searchFrom, StringComparison.Ordinal);
+            if (markerIdx < 0) break;
+
+            // Vind .push( na de marker
+            int pushIdx = html.IndexOf(".push(", markerIdx, StringComparison.Ordinal);
+            if (pushIdx < 0) break;
+
+            int jsonStart = pushIdx + 6; // na ".push("
+            searchFrom = jsonStart;
+
+            // Balanceer accolades om de volledige JSON te extraheren
+            int depth = 0, jsonEnd = -1;
+            for (int i = jsonStart; i < html.Length; i++)
+            {
+                if (html[i] == '{') depth++;
+                else if (html[i] == '}')
+                {
+                    depth--;
+                    if (depth == 0) { jsonEnd = i + 1; break; }
+                }
+            }
+            if (jsonEnd < 0) continue;
+
+            // AH injecteert soms JS-literals zoals 'undefined' die geen geldig JSON zijn.
+            // Vervang ze door null zodat JsonDocument.Parse niet faalt.
+            var jsonStr = html[jsonStart..jsonEnd]
+                .Replace(":undefined", ":null")
+                .Replace(",undefined", ",null")
+                .Replace("[undefined", "[null");
             try
             {
-                using var doc = JsonDocument.Parse(m.Groups[1].Value);
+                using var doc = JsonDocument.Parse(jsonStr);
                 var root = doc.RootElement;
 
                 if (!root.TryGetProperty("rehydrate", out var rehydrate)) continue;
 
-                foreach (var cacheEntry in rehydrate.EnumerateObject())
+                foreach (var entry in rehydrate.EnumerateObject())
                 {
-                    if (!cacheEntry.Value.TryGetProperty("data", out var data)) continue;
+                    if (!entry.Value.TryGetProperty("data", out var data)) continue;
                     if (!data.TryGetProperty("searchProducts", out var sp)) continue;
                     if (!sp.TryGetProperty("products", out var productsEl)) continue;
 
+                    var results = new List<ProductMatch>();
                     foreach (var p in productsEl.EnumerateArray())
                     {
                         var match = ParseProduct(p, query);
@@ -127,7 +155,10 @@ public class AlbertHeijnScraper
                     }
                 }
             }
-            catch (JsonException) { /* ongeldige JSON, volgende proberen */ }
+            catch (JsonException ex)
+            {
+                _logger.LogDebug("AH Apollo parse poging mislukt: {Msg}", ex.Message);
+            }
         }
 
         return [];
@@ -142,15 +173,17 @@ public class AlbertHeijnScraper
         bool isPromo = false;
         string promoText = "";
 
-        // priceV2 is het echte schema (price.now bestaat niet meer in huidige AH API)
+        // ── priceV2.now.amount — het huidige AH schema ──
         if (p.TryGetProperty("priceV2", out var pv2))
         {
             if (pv2.TryGetProperty("now", out var nowEl) &&
-                nowEl.TryGetProperty("amount", out var amount))
+                nowEl.TryGetProperty("amount", out var amount) &&
+                amount.ValueKind == JsonValueKind.Number)
                 price = amount.GetDecimal();
 
             if (pv2.TryGetProperty("was", out var wasEl) &&
-                wasEl.TryGetProperty("amount", out var wasAmt))
+                wasEl.TryGetProperty("amount", out var wasAmt) &&
+                wasAmt.ValueKind == JsonValueKind.Number)
                 normalPrice = wasAmt.GetDecimal();
 
             if (pv2.TryGetProperty("promotionLabels", out var labels) &&
@@ -158,8 +191,7 @@ public class AlbertHeijnScraper
                 labels.GetArrayLength() > 0)
             {
                 isPromo   = true;
-                var first = labels[0];
-                promoText = first.TryGetProperty("text", out var lt)
+                promoText = labels[0].TryGetProperty("text", out var lt)
                     ? lt.GetString() ?? "Bonus" : "Bonus";
             }
 
@@ -167,7 +199,7 @@ public class AlbertHeijnScraper
                 disc.ValueKind != JsonValueKind.Null)
                 isPromo = true;
         }
-        // Fallback oud schema (voor mobile API responses)
+        // ── Oud schema fallback (mobile API) ──
         else if (p.TryGetProperty("price", out var pr))
         {
             if (pr.TryGetProperty("now", out var now))
@@ -178,6 +210,7 @@ public class AlbertHeijnScraper
                 normalPrice = was.ValueKind == JsonValueKind.Number
                     ? was.GetDecimal()
                     : was.TryGetProperty("amount", out var wa) ? wa.GetDecimal() : 0;
+            if (normalPrice > price && price > 0) isPromo = true;
         }
 
         if (price <= 0) return null;
@@ -236,7 +269,6 @@ public class AlbertHeijnScraper
                 var match = ParseProduct(p, item.Name);
                 if (match != null) results.Add(match);
             }
-
             return results.OrderByDescending(r => r.MatchConfidence).Take(1).ToList();
         }
         catch (Exception ex)
