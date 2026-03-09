@@ -99,7 +99,7 @@ public class CompareService
 
         // ── Prijzen per winkel ophalen (parallel) ─────────────────────
         var storeTasks = stores.Select(store =>
-            BuildStoreComparisonAsync(store, request, fuelNl, fuelBe, fuelDe));
+            BuildStoreComparisonAsync(store, request, hasFallback, fuelNl, fuelBe, fuelDe));
 
         var comparisons = await Task.WhenAll(storeTasks);
 
@@ -163,7 +163,7 @@ public class CompareService
 
     // ─────────────────────────────────────────────────────────────────
     private async Task<StoreComparison?> BuildStoreComparisonAsync(
-        StoreTemplate store, CompareRequest request,
+        StoreTemplate store, CompareRequest request, bool usingFallback,
         decimal fuelNl, decimal fuelBe, decimal fuelDe)
     {
         try
@@ -195,7 +195,7 @@ public class CompareService
             };
 
             decimal fuelCost = 0;
-            if (!request.HasFallbackStores && store.DistanceKm > 0)
+            if (!usingFallback && store.DistanceKm > 0)
             {
                 // Gebruik opgeslagen afstand als Google Maps al gerekend heeft
                 fuelCost = (decimal)(store.DistanceKm * 2)
@@ -423,8 +423,4 @@ public class CompareService
     }
 }
 
-// Extension om HasFallbackStores te gebruiken in BuildStoreComparisonAsync
-file static class CompareRequestExtensions
-{
-    public static bool HasFallbackStores(this CompareRequest r) => false;
-}
+
