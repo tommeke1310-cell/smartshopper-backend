@@ -1,16 +1,25 @@
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using SmartShopper.API.Models;
 
 namespace SmartShopper.API.Services.Scrapers;
 
+/// <summary>
+/// AH scraper via HTML-parsing van Apollo SSR data.
+/// De AH GQL API en Mobile API blokkeren datacenter-IPs (Railway).
+/// De website (www.ah.nl/zoeken?query=...) servert Apollo SSR data in een script-tag,
+/// die altijd beschikbaar is zonder API-sleutels of IP-whitelisting.
+/// Echte prijs zit in: priceV2.now.amount (niet price.now)
+/// </summary>
 public class AlbertHeijnScraper
 {
     private readonly HttpClient _http;
     private readonly ILogger<AlbertHeijnScraper> _logger;
 
-    private const string AH_GQL_URL   = "https://www.ah.nl/gql";
-    private const string AH_TOKEN_URL = "https://api.ah.nl/mobile-auth/v1/auth/token/anonymous";
+    private const string AH_SEARCH_URL = "https://www.ah.nl/zoeken?query={0}&page=1";
+    private const string AH_TOKEN_URL  = "https://api.ah.nl/mobile-auth/v1/auth/token/anonymous";
 
     private static string?  _cachedAnonToken;
     private static DateTime _tokenExpiry = DateTime.MinValue;
@@ -20,26 +29,27 @@ public class AlbertHeijnScraper
     {
         _http   = http;
         _logger = logger;
+
+        // Browser-headers zodat www.ah.nl niet blokkeert
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "*/*");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Origin",  "https://www.ah.nl");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://www.ah.nl/");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-dest", "empty");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-mode", "cors");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-site", "same-origin");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("client-name",    "ah-bonus");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("client-version", "3.544.16");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-dest", "document");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-mode", "navigate");
+        _http.Timeout = TimeSpan.FromSeconds(20);
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string? bearerToken = null)
     {
-        // Stap 1: Website GQL (best voor server-side rendering)
-        var results = await TryWebGql(item);
+        // 1. HTML scrapen via Apollo SSR (altijd beschikbaar)
+        var results = await TryHtmlScrape(item);
         if (results.Count > 0) return results;
 
-        // Stap 2: Mobile API met bearer token
+        // 2. Mobile API fallback
         results = await TryMobileApi(item, bearerToken);
         if (results.Count > 0) return results;
 
@@ -47,79 +57,80 @@ public class AlbertHeijnScraper
         return [];
     }
 
-    // ─── Website GQL (www.ah.nl/gql) ─────────────────────────────
-    private async Task<List<ProductMatch>> TryWebGql(GroceryItem item)
+    // ─── Methode 1: HTML-pagina scrapen + Apollo SSR data ─────────
+    private async Task<List<ProductMatch>> TryHtmlScrape(GroceryItem item)
     {
         try
         {
-            var payload = new
-            {
-                operationName = "SearchProducts",
-                query = @"query SearchProducts($query: String!, $size: Int) {
-                    searchProducts(query: $query, size: $size) {
-                        products {
-                            title
-                            brand { name }
-                            price { now was }
-                            discount { description }
-                            images { url }
-                            webUrl
-                        }
-                    }
-                }",
-                variables = new { query = item.Name, size = 10 }
-            };
+            var url = string.Format(AH_SEARCH_URL, Uri.EscapeDataString(item.Name));
+            var response = await _http.GetAsync(url);
 
-            using var req = new HttpRequestMessage(HttpMethod.Post, AH_GQL_URL);
-            req.Content = JsonContent.Create(payload);
-
-            var response = await _http.SendAsync(req);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("AH GQL: {Status}", response.StatusCode);
+                _logger.LogWarning("AH HTML: HTTP {Status} voor '{Product}'", response.StatusCode, item.Name);
                 return [];
             }
 
-            var json = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
+            var html = await response.Content.ReadAsStringAsync();
+            var products = ParseApolloSsr(html, item.Name);
 
-            if (!doc.RootElement.TryGetProperty("data", out var data)) return [];
-            if (!data.TryGetProperty("searchProducts", out var sp)) return [];
-            if (!sp.TryGetProperty("products", out var products)) return [];
-
-            var candidates = new List<ProductMatch>();
-            foreach (var p in products.EnumerateArray())
-            {
-                var match = ParseProduct(p, item.Name);
-                if (match != null) candidates.Add(match);
-                if (candidates.Count >= 10) break;
-            }
-
-            if (candidates.Count == 0) return [];
-
-            // Selecteer beste match op basis van verbeterde score
-            var best = candidates
-                .OrderByDescending(r => r.MatchConfidence)
-                .FirstOrDefault();
-
-            if (best == null || !ProductMatcher.IsReliableMatch(best.MatchConfidence))
-            {
-                _logger.LogWarning("AH GQL: lage match-score ({Score:F2}) voor '{Product}'",
-                    best?.MatchConfidence ?? 0, item.Name);
-                // Geef toch terug maar markeer als onbetrouwbaar via lage score
-                if (best != null) return [best];
-                return [];
-            }
-
-            _logger.LogInformation("AH GQL: beste match '{Found}' (score {Score:F2}) voor '{Query}'",
-                best.ProductName, best.MatchConfidence, item.Name);
-            return [best];
+            _logger.LogInformation("AH HTML: {Count} resultaten voor '{Product}'", products.Count, item.Name);
+            return products;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "AH GQL mislukt voor '{Product}'", item.Name);
+            _logger.LogWarning(ex, "AH HTML scrape mislukt voor '{Product}'", item.Name);
             return [];
         }
+    }
+
+    // ─── Apollo SSR parser ─────────────────────────────────────────
+    // AH injecteert data als:
+    //   (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({"rehydrate":{...}})
+    // De JSON bevat searchProducts -> products[] met priceV2.now.amount
+    private List<ProductMatch> ParseApolloSsr(string html, string query)
+    {
+        var results = new List<ProductMatch>();
+
+        var regex = new Regex(
+            @"\(window\[Symbol\.for\(""ApolloSSRDataTransport""\)\][^)]*\)\.push\((\{.+?\})\);",
+            RegexOptions.Singleline);
+
+        foreach (Match m in regex.Matches(html))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(m.Groups[1].Value);
+                var root = doc.RootElement;
+
+                if (!root.TryGetProperty("rehydrate", out var rehydrate)) continue;
+
+                foreach (var cacheEntry in rehydrate.EnumerateObject())
+                {
+                    if (!cacheEntry.Value.TryGetProperty("data", out var data)) continue;
+                    if (!data.TryGetProperty("searchProducts", out var sp)) continue;
+                    if (!sp.TryGetProperty("products", out var productsEl)) continue;
+
+                    foreach (var p in productsEl.EnumerateArray())
+                    {
+                        var match = ParseProduct(p, query);
+                        if (match != null) results.Add(match);
+                    }
+
+                    if (results.Count > 0)
+                    {
+                        return results
+                            .OrderByDescending(r => r.MatchConfidence)
+                            .ThenBy(r => r.Price)
+                            .Take(1)
+                            .ToList();
+                    }
+                }
+            }
+            catch (JsonException) { /* ongeldige JSON, volgende proberen */ }
+        }
+
+        return [];
     }
 
     private ProductMatch? ParseProduct(JsonElement p, string query)
@@ -131,25 +142,49 @@ public class AlbertHeijnScraper
         bool isPromo = false;
         string promoText = "";
 
-        if (p.TryGetProperty("price", out var pr))
+        // priceV2 is het echte schema (price.now bestaat niet meer in huidige AH API)
+        if (p.TryGetProperty("priceV2", out var pv2))
         {
-            price = pr.TryGetProperty("now", out var now) && now.ValueKind == JsonValueKind.Number
-                ? now.GetDecimal() : 0;
-            normalPrice = pr.TryGetProperty("was", out var was) && was.ValueKind == JsonValueKind.Number
-                ? was.GetDecimal() : price;
-            if (normalPrice > price && price > 0) isPromo = true;
+            if (pv2.TryGetProperty("now", out var nowEl) &&
+                nowEl.TryGetProperty("amount", out var amount))
+                price = amount.GetDecimal();
+
+            if (pv2.TryGetProperty("was", out var wasEl) &&
+                wasEl.TryGetProperty("amount", out var wasAmt))
+                normalPrice = wasAmt.GetDecimal();
+
+            if (pv2.TryGetProperty("promotionLabels", out var labels) &&
+                labels.ValueKind == JsonValueKind.Array &&
+                labels.GetArrayLength() > 0)
+            {
+                isPromo   = true;
+                var first = labels[0];
+                promoText = first.TryGetProperty("text", out var lt)
+                    ? lt.GetString() ?? "Bonus" : "Bonus";
+            }
+
+            if (pv2.TryGetProperty("discount", out var disc) &&
+                disc.ValueKind != JsonValueKind.Null)
+                isPromo = true;
         }
+        // Fallback oud schema (voor mobile API responses)
+        else if (p.TryGetProperty("price", out var pr))
+        {
+            if (pr.TryGetProperty("now", out var now))
+                price = now.ValueKind == JsonValueKind.Number
+                    ? now.GetDecimal()
+                    : now.TryGetProperty("amount", out var a) ? a.GetDecimal() : 0;
+            if (pr.TryGetProperty("was", out var was))
+                normalPrice = was.ValueKind == JsonValueKind.Number
+                    ? was.GetDecimal()
+                    : was.TryGetProperty("amount", out var wa) ? wa.GetDecimal() : 0;
+        }
+
         if (price <= 0) return null;
+        if (normalPrice <= 0) normalPrice = price;
+        if (normalPrice > price) isPromo = true;
 
-        if (p.TryGetProperty("discount", out var disc) &&
-            disc.TryGetProperty("description", out var dd))
-        {
-            isPromo   = true;
-            promoText = dd.GetString() ?? "Bonus";
-        }
-
-        var brand = p.TryGetProperty("brand", out var b) &&
-                    b.TryGetProperty("name", out var bn) ? bn.GetString() ?? "" : "";
+        var brand = p.TryGetProperty("brand", out var br) ? br.GetString() ?? "" : "";
         bool isHuismerk = string.IsNullOrEmpty(brand) ||
                           brand.Equals("AH", StringComparison.OrdinalIgnoreCase) ||
                           title.StartsWith("AH ", StringComparison.OrdinalIgnoreCase);
@@ -160,22 +195,20 @@ public class AlbertHeijnScraper
             Country         = "NL",
             ProductName     = title,
             Price           = price,
-            NormalPrice     = normalPrice > 0 ? normalPrice : price,
+            NormalPrice     = normalPrice,
             IsPromo         = isPromo,
             PromoText       = promoText,
             IsEstimated     = false,
-            IsBiologisch    = title.Contains("biologisch", StringComparison.OrdinalIgnoreCase) ||
-                              title.Contains(" bio ", StringComparison.OrdinalIgnoreCase),
+            IsBiologisch    = title.Contains("biologisch", StringComparison.OrdinalIgnoreCase),
             IsVegan         = title.Contains("vegan", StringComparison.OrdinalIgnoreCase),
             IsHuisMerk      = isHuismerk,
             IsAMerk         = !isHuismerk,
-            // Gebruik verbeterde ProductMatcher i.p.v. simpele WordScore
             MatchConfidence = ProductMatcher.Score(query, title),
-            LastUpdated     = DateTime.UtcNow
+            LastUpdated     = DateTime.UtcNow,
         };
     }
 
-    // ─── Mobile API fallback ──────────────────────────────────────
+    // ─── Methode 2: Mobile API fallback ───────────────────────────
     private async Task<List<ProductMatch>> TryMobileApi(GroceryItem item, string? userToken)
     {
         try
@@ -185,9 +218,10 @@ public class AlbertHeijnScraper
 
             using var req = new HttpRequestMessage(HttpMethod.Get,
                 $"https://api.ah.nl/mobile-services/product/search/v2" +
-                $"?query={Uri.EscapeDataString(item.Name)}&size=10&sortBy=RELEVANCE");
+                $"?query={Uri.EscapeDataString(item.Name)}&size=5&sortBy=RELEVANCE");
             req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
-            req.Headers.TryAddWithoutValidation("x-application", "appie");
+            req.Headers.TryAddWithoutValidation("x-application", "appie-android");
+            req.Headers.TryAddWithoutValidation("User-Agent",    "Appie/8.22.3 (Android)");
 
             var response = await _http.SendAsync(req);
             if (!response.IsSuccessStatusCode) return [];
@@ -196,44 +230,20 @@ public class AlbertHeijnScraper
             using var doc = JsonDocument.Parse(json);
             if (!doc.RootElement.TryGetProperty("products", out var products)) return [];
 
-            var candidates = new List<ProductMatch>();
+            var results = new List<ProductMatch>();
             foreach (var p in products.EnumerateArray())
             {
-                var title = p.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
-                if (string.IsNullOrEmpty(title)) continue;
-
-                decimal price = 0;
-                if (p.TryGetProperty("price", out var pr))
-                    price = pr.TryGetProperty("now", out var now) ? now.GetDecimal() :
-                            pr.TryGetProperty("unitPrice", out var up) ? up.GetDecimal() : 0;
-                if (price <= 0) continue;
-
-                candidates.Add(new ProductMatch
-                {
-                    StoreName       = "Albert Heijn",
-                    Country         = "NL",
-                    ProductName     = title,
-                    Price           = price,
-                    NormalPrice     = price,
-                    IsEstimated     = false,
-                    MatchConfidence = ProductMatcher.Score(item.Name, title),
-                    LastUpdated     = DateTime.UtcNow
-                });
-                if (candidates.Count >= 10) break;
+                var match = ParseProduct(p, item.Name);
+                if (match != null) results.Add(match);
             }
 
-            if (candidates.Count == 0) return [];
-
-            var best = candidates.OrderByDescending(c => c.MatchConfidence).First();
-            _logger.LogInformation("AH Mobile: '{Found}' (score {Score:F2}) voor '{Query}'",
-                best.ProductName, best.MatchConfidence, item.Name);
-            return [best];
+            return results.OrderByDescending(r => r.MatchConfidence).Take(1).ToList();
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "AH Mobile mislukt voor '{Product}'", item.Name);
+            _logger.LogWarning(ex, "AH Mobile API mislukt voor '{Product}'", item.Name);
+            return [];
         }
-        return [];
     }
 
     private async Task<string> GetAnonTokenAsync()
@@ -246,7 +256,7 @@ public class AlbertHeijnScraper
             if (!string.IsNullOrEmpty(_cachedAnonToken) && DateTime.UtcNow < _tokenExpiry)
                 return _cachedAnonToken;
             using var req = new HttpRequestMessage(HttpMethod.Post, AH_TOKEN_URL);
-            req.Content = JsonContent.Create(new { clientId = "appie" });
+            req.Content = JsonContent.Create(new { clientId = "appie-android" });
             req.Headers.TryAddWithoutValidation("x-application", "appie");
             var resp = await _http.SendAsync(req);
             if (!resp.IsSuccessStatusCode) return "";
@@ -269,8 +279,10 @@ public class AlbertHeijnScraper
                 "https://api.ah.nl/mobile-auth/v1/auth/token");
             req.Content = JsonContent.Create(new
             {
-                clientId = "appie", username = email,
-                password = password, grantType = "password"
+                clientId  = "appie-android",
+                username  = email,
+                password  = password,
+                grantType = "password"
             });
             req.Headers.TryAddWithoutValidation("x-application", "appie");
             var resp = await _http.SendAsync(req);
