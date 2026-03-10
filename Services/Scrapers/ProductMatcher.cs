@@ -101,6 +101,12 @@ public static class ProductMatcher
         ["eieren"]           = new[] { "eier", "eggs", "oeufs" },
         ["chocolade"]        = new[] { "chocola", "chocolate", "schokolade" },
         ["chips"]            = new[] { "crisps", "snacks" },
+        ["noten"]            = new[] { "nuts", "mixed nuts", "noix", "cashewnoten", "amandelen", "walnoten" },
+        ["mosterd"]          = new[] { "mustard", "moutarde", "senf", "zaanse mosterd" },
+        ["zure room"]        = new[] { "creme fraiche", "sour cream", "zuivelproduct" },
+        ["ontbijtgranen"]    = new[] { "cornflakes", "muesli", "granola", "granenontbijt", "kelloggs" },
+        ["eieren"]           = new[] { "ei", "kippenei", "eggs", "oeufs", "eier" },
+        ["ham"]              = new[] { "gekookte ham", "ham naturel", "achterham", "voorham", "jambon" },
     };
 
     // ── 2. Merkproducten met vaste prijs (2025-prijzen, AH als referentie) ──
@@ -234,6 +240,17 @@ public static class ProductMatcher
         var pComp = pNorm.Replace(" ", "");
         if (pComp.Contains(qComp) || qComp.Contains(pComp))
             return 0.9;
+
+        // Multi-word query directe synoniem lookup (bijv. 'zure room' -> 'creme fraiche')
+        if (Synoniemen.TryGetValue(qNorm, out var directSyns))
+        {
+            foreach (var syn in directSyns)
+            {
+                var synNorm = Normalize(syn);
+                if (pNorm.Contains(synNorm) || synNorm.Contains(pNorm))
+                    return 0.85;
+            }
+        }
 
         var queryWords   = qNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var productWords = pNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
