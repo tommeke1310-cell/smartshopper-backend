@@ -1,5 +1,6 @@
 using SmartShopper.API.Models;
 using System.Text.Json;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace SmartShopper.API.Services.Routing;
 

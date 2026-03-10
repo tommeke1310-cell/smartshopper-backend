@@ -1,6 +1,7 @@
 using SmartShopper.API.Models;
 using SmartShopper.API.Services.Scrapers;
 using SmartShopper.API.Services.Routing;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace SmartShopper.API.Services;
 

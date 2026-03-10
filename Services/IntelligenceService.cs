@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Net.Http.Json;
 using System.Globalization;
 using SmartShopper.API.Models;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace SmartShopper.API.Services;
 
