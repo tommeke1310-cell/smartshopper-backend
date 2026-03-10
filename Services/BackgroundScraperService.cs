@@ -235,7 +235,7 @@ public class BackgroundScraperService : BackgroundService
                 var title = item.TryGetProperty("keyfacts", out var kf) && kf.TryGetProperty("name", out var n)
                     ? n.GetString() ?? query : query;
                 bool promo = item.TryGetProperty("price", out var po) && po.TryGetProperty("discount", out _);
-                double score = ProductMatcher.Score(query, title);
+                double score = ProductMatcher.MatchScore(query, title);
                 candidates.Add((price, promo, score));
             }
         }

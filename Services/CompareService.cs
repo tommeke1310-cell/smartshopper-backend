@@ -15,6 +15,8 @@ public class CompareService
     private readonly JumboScraper       _jumbo;
     private readonly LidlScraper        _lidl;
     private readonly AldiScraper        _aldi;
+    private readonly PlusScraper        _plus;
+    private readonly DirkScraper        _dirk;
     private readonly ColruytScraper     _colruyt;
     private readonly DelhaizeScraper    _delhaize;
     private readonly ReweScraper        _rewe;
@@ -57,6 +59,8 @@ public class CompareService
         JumboScraper       jumbo,
         LidlScraper        lidl,
         AldiScraper        aldi,
+        PlusScraper        plus,
+        DirkScraper        dirk,
         ColruytScraper     colruyt,
         DelhaizeScraper    delhaize,
         ReweScraper        rewe,
@@ -68,6 +72,8 @@ public class CompareService
         _jumbo    = jumbo;
         _lidl     = lidl;
         _aldi     = aldi;
+        _plus     = plus;
+        _dirk     = dirk;
         _colruyt  = colruyt;
         _delhaize = delhaize;
         _rewe     = rewe;
@@ -282,6 +288,8 @@ public class CompareService
                 ("Aldi",         "BE") => await _aldi.SearchProductAsync(genericItem, "BE"),
                 ("Aldi Süd",     "DE") => await _aldi.SearchProductAsync(genericItem, "DE"),
                 ("Aldi",         _)    => await _aldi.SearchProductAsync(genericItem, "NL"),
+                ("Plus",         _)    => await _plus.SearchProductAsync(genericItem),
+                ("Dirk",         _)    => await _dirk.SearchProductAsync(genericItem),
                 ("Colruyt",      _)    => await _colruyt.SearchProductAsync(genericItem),
                 ("Delhaize",     _)    => await _delhaize.SearchProductAsync(genericItem),
                 ("Rewe",         _)    => await _rewe.SearchProductAsync(genericItem),

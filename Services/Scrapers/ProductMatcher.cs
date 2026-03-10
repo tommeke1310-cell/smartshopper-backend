@@ -98,14 +98,13 @@ public static class ProductMatcher
         ["sojasaus"]         = new[] { "soja saus", "soy sauce", "sojasosse" },
         ["olijfolie"]        = new[] { "olijf olie", "olive oil", "huile d olive" },
         // Divers
-        ["eieren"]           = new[] { "eier", "eggs", "oeufs" },
+        ["eieren"]           = new[] { "ei", "kippenei", "eggs", "oeufs", "eier" },
         ["chocolade"]        = new[] { "chocola", "chocolate", "schokolade" },
         ["chips"]            = new[] { "crisps", "snacks" },
         ["noten"]            = new[] { "nuts", "mixed nuts", "noix", "cashewnoten", "amandelen", "walnoten" },
         ["mosterd"]          = new[] { "mustard", "moutarde", "senf", "zaanse mosterd" },
         ["zure room"]        = new[] { "creme fraiche", "sour cream", "zuivelproduct" },
         ["ontbijtgranen"]    = new[] { "cornflakes", "muesli", "granola", "granenontbijt", "kelloggs" },
-        ["eieren"]           = new[] { "ei", "kippenei", "eggs", "oeufs", "eier" },
         ["ham"]              = new[] { "gekookte ham", "ham naturel", "achterham", "voorham", "jambon" },
     };
 
@@ -321,4 +320,25 @@ public static class ProductMatcher
     }
 
     public static bool IsMerkProduct(string query) => GetMerkPrijs(query) != null;
+
+    // ── 9. Alias voor backwards-compat (gebruikt in CompareService & BackgroundScraperService) ──
+    public static double Score(string query, string productName) => MatchScore(query, productName);
+
+    // ── 10. Strip winkelketen-prefix zodat AH-productnamen ook bij Jumbo/Lidl/etc. zoeken ──
+    //  "AH rundergehakt 500g" → "rundergehakt"
+    //  "Coca-Cola Zero"       → "Coca-Cola Zero"  (A-merk blijft intact)
+    private static readonly HashSet<string> StorePrefix = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ah", "albert heijn", "jumbo", "lidl", "aldi", "plus", "dirk",
+        "colruyt", "delhaize", "carrefour", "rewe", "edeka", "kaufland", "penny",
+    };
+
+    public static string GenericSearchName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return name;
+        var parts = name.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2 && StorePrefix.Contains(parts[0]))
+            return parts[1].Trim();
+        return name.Trim();
+    }
 }

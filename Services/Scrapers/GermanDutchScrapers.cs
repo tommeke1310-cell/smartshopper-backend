@@ -60,8 +60,8 @@ public class LidlScraper
             var domain = country switch { "DE" => "lidl.de", "BE" => "lidl.be", _ => "lidl.nl" };
             var lang   = country switch { "DE" => "de", "BE" => "nl", _ => "nl" };
 
-            // Probeer de interne API-route die de website zelf gebruikt
-            var url = $"https://www.{domain}/{lang}/s/?q={Uri.EscapeDataString(query)}&source=typeAheadSuggestion";
+            // Lidl search API
+            var url = $"https://www.{domain}/api/search/catalog/products/{lang}/?query={Uri.EscapeDataString(query)}&sortBy=price&pageNumber=1&pageSize=5";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Accept", "application/json, */*");
@@ -320,28 +320,35 @@ public class AldiScraper
     {
         try
         {
-            var url = $"https://api.aldi-sued.de/v1/search" +
-                      $"?term={Uri.EscapeDataString(query)}&page=1&pageSize=5&country=DE";
+            // Aldi Süd DE via hun website search API
+            var url = $"https://www.aldi-sued.de/de/suche.html?search={Uri.EscapeDataString(query)}";
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("x-api-key", "public");
+            req.Headers.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
+            req.Headers.TryAddWithoutValidation("Referer", "https://www.aldi-sued.de/");
 
             var response = await _http.SendAsync(req);
             if (response.IsSuccessStatusCode)
             {
                 var json = await response.Content.ReadAsStringAsync();
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("data", out var data))
+                // Probeer JSON response te parsen
+                if (json.TrimStart().StartsWith("{") || json.TrimStart().StartsWith("["))
                 {
-                    foreach (var item in data.EnumerateArray())
+                    using var doc = JsonDocument.Parse(json);
+                    JsonElement items;
+                    if ((doc.RootElement.TryGetProperty("data",     out items) ||
+                         doc.RootElement.TryGetProperty("products", out items) ||
+                         doc.RootElement.TryGetProperty("results",  out items)) &&
+                        items.ValueKind == JsonValueKind.Array)
                     {
-                        decimal price = 0;
-                        if (item.TryGetProperty("pricing", out var pr) &&
-                            pr.TryGetProperty("currentPrice", out var cp))
-                            price = cp.GetDecimal();
-                        if (price <= 0) continue;
-                        var title = item.TryGetProperty("name", out var n) ? n.GetString() ?? query : query;
-                        _logger.LogInformation("Aldi Süd DE: {Product} → €{Price}", title, price);
-                        return new ScraperResult(title, price, true);
+                        foreach (var item in items.EnumerateArray())
+                        {
+                            decimal price = ExtractAldiJsonPrice(item);
+                            if (price <= 0) continue;
+                            var title = item.TryGetProperty("name",  out var n) ? n.GetString() ?? query :
+                                        item.TryGetProperty("title", out var t) ? t.GetString() ?? query : query;
+                            _logger.LogInformation("Aldi Süd DE: {Product} → €{Price}", title, price);
+                            return new ScraperResult(title, price, true);
+                        }
                     }
                 }
             }
@@ -690,4 +697,231 @@ public class EdekaScraper
     // WordScore vervangen door ProductMatcher.MatchScore
 }
 
+// ─────────────────────────────────────────────────────────────────
+//  PLUS  (NL) — via plus.nl webshop search
+// ─────────────────────────────────────────────────────────────────
+public class PlusScraper
+{
+    private readonly HttpClient          _http;
+    private readonly ILogger<PlusScraper> _logger;
+
+    public PlusScraper(HttpClient http, ILogger<PlusScraper> logger)
+    {
+        _http   = http;
+        _logger = logger;
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://www.plus.nl/");
+    }
+
+    public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item)
+    {
+        var raw = await TryPlusApi(item.Name);
+        if (!raw.Success) raw = await TryPlusHtml(item.Name);
+        if (!raw.Success) return [];
+
+        return [new ProductMatch
+        {
+            StoreName       = "Plus",
+            Country         = "NL",
+            ProductName     = raw.ProductName,
+            Price           = raw.Price,
+            IsPromo         = raw.IsPromo,
+            IsEstimated     = false,
+            MatchConfidence = ProductMatcher.MatchScore(item.Name, raw.ProductName),
+            IsBiologisch    = raw.ProductName.Contains("bio", StringComparison.OrdinalIgnoreCase),
+            IsHuisMerk      = raw.ProductName.StartsWith("Plus ", StringComparison.OrdinalIgnoreCase),
+            IsAMerk         = !raw.ProductName.StartsWith("Plus ", StringComparison.OrdinalIgnoreCase),
+        }];
+    }
+
+    private async Task<ScraperResult> TryPlusApi(string query)
+    {
+        try
+        {
+            // Plus webshop search JSON endpoint
+            var url = $"https://www.plus.nl/INTERSHOP/web/WFS/PL-PL-Site/-/EUR/ViewParametricSearch-SimpleParametricSearchRequest" +
+                      $"?SearchParameter=%26%40QueryTerm%3D{Uri.EscapeDataString(query)}%26ContextCategoryUUID%3D&CatalogCategoryID=&SearchTerm={Uri.EscapeDataString(query)}&PageSize=5";
+
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+
+            var json = await response.Content.ReadAsStringAsync();
+            if (!json.TrimStart().StartsWith("{") && !json.TrimStart().StartsWith("["))
+                return new ScraperResult(query, 0, false);
+
+            using var doc = JsonDocument.Parse(json);
+            JsonElement products;
+            if (!doc.RootElement.TryGetProperty("products", out products) &&
+                !doc.RootElement.TryGetProperty("ProductList", out products) &&
+                !doc.RootElement.TryGetProperty("items", out products))
+                return new ScraperResult(query, 0, false);
+
+            foreach (var p in products.EnumerateArray())
+            {
+                decimal price = 0;
+                if (p.TryGetProperty("SalesPrice",       out var sp)) price = sp.GetDecimal();
+                else if (p.TryGetProperty("price",       out var pp)) price = pp.ValueKind == JsonValueKind.Number ? pp.GetDecimal() : 0;
+                else if (p.TryGetProperty("currentPrice",out var cp)) price = cp.GetDecimal();
+                if (price <= 0) continue;
+
+                var name = p.TryGetProperty("ProductName",  out var n1) ? n1.GetString() ?? query :
+                           p.TryGetProperty("name",         out var n2) ? n2.GetString() ?? query : query;
+                bool isPromo = p.TryGetProperty("IsPromo", out var ip) && ip.ValueKind == JsonValueKind.True;
+
+                _logger.LogInformation("Plus NL: {Product} → €{Price}", name, price);
+                return new ScraperResult(name, price, true) { IsPromo = isPromo };
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Plus API mislukt voor {Product}", query); }
+        return new ScraperResult(query, 0, false);
+    }
+
+    private async Task<ScraperResult> TryPlusHtml(string query)
+    {
+        try
+        {
+            var url = $"https://www.plus.nl/zoekresultaten?SearchTerm={Uri.EscapeDataString(query)}";
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+
+            var html = await response.Content.ReadAsStringAsync();
+            var doc  = new HtmlDocument();
+            doc.LoadHtml(html);
+
+            var priceNode = doc.DocumentNode.SelectSingleNode(
+                "//*[contains(@class,'product-price__sales-price')] | " +
+                "//*[contains(@class,'price-label')] | " +
+                "//*[@itemprop='price'] | " +
+                "//span[contains(@class,'price')]");
+
+            if (priceNode != null)
+            {
+                var raw = priceNode.Name == "meta"
+                    ? priceNode.GetAttributeValue("content", "")
+                    : priceNode.InnerText;
+                var m = System.Text.RegularExpressions.Regex.Match(raw.Replace(",", "."), @"\d+[\.,]\d{2}");
+                if (m.Success && decimal.TryParse(m.Value, System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out decimal p) && p > 0)
+                {
+                    _logger.LogInformation("Plus HTML: {Product} → €{Price}", query, p);
+                    return new ScraperResult(query, p, true);
+                }
+            }
+        }
+        catch (Exception ex) { _logger.LogError(ex, "Plus HTML fout voor {Product}", query); }
+        return new ScraperResult(query, 0, false);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  DIRK  (NL) — via dirk.nl webshop
+// ─────────────────────────────────────────────────────────────────
+public class DirkScraper
+{
+    private readonly HttpClient          _http;
+    private readonly ILogger<DirkScraper> _logger;
+
+    public DirkScraper(HttpClient http, ILogger<DirkScraper> logger)
+    {
+        _http   = http;
+        _logger = logger;
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, */*");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://www.dirk.nl/");
+    }
+
+    public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item)
+    {
+        var raw = await TryDirkApi(item.Name);
+        if (!raw.Success) raw = await TryDirkHtml(item.Name);
+        if (!raw.Success) return [];
+
+        return [new ProductMatch
+        {
+            StoreName       = "Dirk",
+            Country         = "NL",
+            ProductName     = raw.ProductName,
+            Price           = raw.Price,
+            IsPromo         = raw.IsPromo,
+            IsEstimated     = false,
+            MatchConfidence = ProductMatcher.MatchScore(item.Name, raw.ProductName),
+            IsHuisMerk      = raw.ProductName.StartsWith("Dirk", StringComparison.OrdinalIgnoreCase),
+            IsAMerk         = !raw.ProductName.StartsWith("Dirk", StringComparison.OrdinalIgnoreCase),
+        }];
+    }
+
+    private async Task<ScraperResult> TryDirkApi(string query)
+    {
+        try
+        {
+            var url = $"https://www.dirk.nl/boodschappen/search?q={Uri.EscapeDataString(query)}&format=json&pageSize=5";
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+
+            var json = await response.Content.ReadAsStringAsync();
+            if (!json.TrimStart().StartsWith("{") && !json.TrimStart().StartsWith("["))
+                return new ScraperResult(query, 0, false);
+
+            using var doc = JsonDocument.Parse(json);
+            JsonElement products;
+            if (!doc.RootElement.TryGetProperty("products", out products) &&
+                !doc.RootElement.TryGetProperty("results",  out products))
+                return new ScraperResult(query, 0, false);
+
+            foreach (var p in products.EnumerateArray())
+            {
+                decimal price = 0;
+                if (p.TryGetProperty("price",        out var pp)) price = pp.ValueKind == JsonValueKind.Number ? pp.GetDecimal() : 0;
+                if (price <= 0 && p.TryGetProperty("priceData", out var pd) &&
+                    pd.TryGetProperty("value", out var v))         price = v.GetDecimal();
+                if (price <= 0) continue;
+
+                var name = p.TryGetProperty("name",  out var n)  ? n.GetString()  ?? query :
+                           p.TryGetProperty("title", out var t)  ? t.GetString()  ?? query : query;
+                _logger.LogInformation("Dirk NL: {Product} → €{Price}", name, price);
+                return new ScraperResult(name, price, true);
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Dirk API mislukt voor {Product}", query); }
+        return new ScraperResult(query, 0, false);
+    }
+
+    private async Task<ScraperResult> TryDirkHtml(string query)
+    {
+        try
+        {
+            var url = $"https://www.dirk.nl/boodschappen/search?q={Uri.EscapeDataString(query)}";
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode) return new ScraperResult(query, 0, false);
+
+            var html = await response.Content.ReadAsStringAsync();
+            var doc  = new HtmlDocument();
+            doc.LoadHtml(html);
+
+            var priceNode = doc.DocumentNode.SelectSingleNode(
+                "//*[contains(@class,'product-price')] | " +
+                "//*[contains(@class,'price-value')] | " +
+                "//*[@data-testid='product-price']");
+
+            if (priceNode != null)
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    priceNode.InnerText.Replace(",", "."), @"\d+\.\d{2}");
+                if (m.Success && decimal.TryParse(m.Value, System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out decimal p) && p > 0)
+                {
+                    _logger.LogInformation("Dirk HTML: {Product} → €{Price}", query, p);
+                    return new ScraperResult(query, p, true);
+                }
+            }
+        }
+        catch (Exception ex) { _logger.LogError(ex, "Dirk HTML fout voor {Product}", query); }
+        return new ScraperResult(query, 0, false);
+    }
+}
 

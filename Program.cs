@@ -100,6 +100,8 @@ AddScraperResilience(builder.Services.AddHttpClient<DmScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<ReweScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<EdekaScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<ColruytScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<PlusScraper>());
+AddScraperResilience(builder.Services.AddHttpClient<DirkScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<DelhaizeScraper>());
 
 // ─── Business services ───────────────────────────────────────────
@@ -119,6 +121,8 @@ builder.Services.AddScoped<DmScraper>();
 builder.Services.AddScoped<ReweScraper>();
 builder.Services.AddScoped<EdekaScraper>();
 builder.Services.AddScoped<ColruytScraper>();
+builder.Services.AddScoped<PlusScraper>();
+builder.Services.AddScoped<DirkScraper>();
 builder.Services.AddScoped<DelhaizeScraper>();
 
 // ─── Business services (Scoped) ──────────────────────────────────

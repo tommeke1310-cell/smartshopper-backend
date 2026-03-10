@@ -60,6 +60,8 @@ public class ScraperHealthService
         var jumbo = scope.ServiceProvider.GetRequiredService<JumboScraper>();
         var lidl  = scope.ServiceProvider.GetRequiredService<LidlScraper>();
         var aldi  = scope.ServiceProvider.GetRequiredService<AldiScraper>();
+        var plus  = scope.ServiceProvider.GetRequiredService<PlusScraper>();
+        var dirk  = scope.ServiceProvider.GetRequiredService<DirkScraper>();
 
         await Task.WhenAll(
             CheckAsync("AlbertHeijn", () => ah.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 })),
@@ -67,7 +69,9 @@ public class ScraperHealthService
             CheckAsync("Lidl NL",     () => lidl.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "NL")),
             CheckAsync("Lidl DE",     () => lidl.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE")),
             CheckAsync("Aldi NL",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "NL")),
-            CheckAsync("Aldi DE",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE"))
+            CheckAsync("Aldi DE",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE")),
+            CheckAsync("Plus NL",     () => plus.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 })),
+            CheckAsync("Dirk NL",     () => dirk.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 }))
         );
 
         var live  = _results.Values.Count(r => r.IsLive);

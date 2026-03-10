@@ -22,17 +22,12 @@ public class AlbertHeijnScraper
         _http   = http;
         _logger = logger;
         // Website headers, niet mobile — werkt beter vanaf datacenter IPs
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "*/*");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Origin",  "https://www.ah.nl");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://www.ah.nl/");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-dest", "empty");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-mode", "cors");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("sec-fetch-site", "same-origin");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("client-name",    "ah-bonus");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("client-version", "3.544.16");
+        // Appie mobile app User-Agent — vermijdt datacenter IP-blokkade beter dan browser UA
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",    "Appie/8.22.3");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Content-Type",  "application/json");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept",        "application/json");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language","nl-NL,nl;q=0.9");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("x-application", "appie");
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string? bearerToken = null)
@@ -162,9 +157,10 @@ public class AlbertHeijnScraper
 
             using var req = new HttpRequestMessage(HttpMethod.Get,
                 $"https://api.ah.nl/mobile-services/product/search/v2" +
-                $"?query={Uri.EscapeDataString(item.Name)}&size=5&sortBy=RELEVANCE");
-            req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
-            req.Headers.TryAddWithoutValidation("x-application", "appie");
+                $"?query={Uri.EscapeDataString(item.Name)}&size=5&sortOn=RELEVANCE");
+            req.Headers.TryAddWithoutValidation("Authorization",  $"Bearer {token}");
+            req.Headers.TryAddWithoutValidation("x-application",  "appie");
+            req.Headers.TryAddWithoutValidation("x-client-name",  "appie-android");
 
             var response = await _http.SendAsync(req);
             if (!response.IsSuccessStatusCode) return [];
@@ -209,7 +205,7 @@ public class AlbertHeijnScraper
             if (!string.IsNullOrEmpty(_cachedAnonToken) && DateTime.UtcNow < _tokenExpiry)
                 return _cachedAnonToken;
             using var req = new HttpRequestMessage(HttpMethod.Post, AH_TOKEN_URL);
-            req.Content = JsonContent.Create(new { clientId = "appie" });
+            req.Content = JsonContent.Create(new { clientId = "appie-android-default" });
             req.Headers.TryAddWithoutValidation("x-application", "appie");
             var resp = await _http.SendAsync(req);
             if (!resp.IsSuccessStatusCode) return "";

@@ -40,16 +40,17 @@ public class JumboScraper
         return [];
     }
 
-    // ─── Jumbo webshop JSON API ───────────────────────────────────
+    // ─── Jumbo mobile API (mobileapi.jumbo.com/v17) — meest betrouwbaar ────
     private async Task<List<ProductMatch>> TryWebshopApi(GroceryItem item)
     {
         try
         {
-            var url = $"https://www.jumbo.com/api/search-page/v1?searchType=keyword" +
-                      $"&searchTerms={Uri.EscapeDataString(item.Name)}&pageSize=5&currentPage=0";
+            // Primair: officiele Jumbo mobile API (geen auth nodig)
+            var url = $"https://mobileapi.jumbo.com/v17/search" +
+                      $"?q={Uri.EscapeDataString(item.Name)}&offset=0&limit=5&type=PRODUCTS";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("x-requested-with", "XMLHttpRequest");
+            req.Headers.TryAddWithoutValidation("x-jumbo-token", "");
 
             var resp = await _http.SendAsync(req);
             if (!resp.IsSuccessStatusCode)
@@ -83,7 +84,7 @@ public class JumboScraper
     {
         try
         {
-            var url  = $"https://www.jumbo.com/zoeken/?q={Uri.EscapeDataString(item.Name)}";
+            var url  = $"https://www.jumbo.com/producten/?searchTerms={Uri.EscapeDataString(item.Name)}";
             var resp = await _http.GetAsync(url);
             if (!resp.IsSuccessStatusCode) return [];
 
