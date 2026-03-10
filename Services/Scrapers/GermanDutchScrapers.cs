@@ -403,60 +403,139 @@ public class AldiScraper
 
 // ─────────────────────────────────────────────────────────────────
 //  DM  (Drogist — NL / DE)
+//  API: product-search.services.dmtech.com (v2 endpoint)
+//  Fallback: dm.de/search HTML scraper
 // ─────────────────────────────────────────────────────────────────
 public class DmScraper
 {
     private readonly HttpClient         _http;
     private readonly ILogger<DmScraper> _logger;
 
+    // DM-specifieke productcategorieën die DM goedkoper heeft dan supermarkten
+    private static readonly HashSet<string> DmSterkCategorieen = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "shampoo","wasmiddel","tandpasta","douchegel","conditioner","deodorant",
+        "scheerschuim","aftershave","handzeep","vloeibare zeep","wasverzachter",
+        "afwasmiddel","schoonmaak","allesreiniger","badkamer","wc","toilet",
+        "babyluier","luier","pamper","zonnebrand","bodymilk","bodylotion",
+        "gezichtscrème","dagcrème","nachtcrème","foundation","mascara",
+        "vitaminen","vitamine","supplement","omega","magnesium","zink",
+        "babyvoeding","babyfood","haarverf","haarmiddel","haarmasker",
+    };
+
     public DmScraper(HttpClient http, ILogger<DmScraper> logger)
     {
         _http   = http;
         _logger = logger;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json,text/html;q=0.9");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9,de;q=0.8");
     }
 
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item, string country = "NL")
     {
+        // Probeer eerst de dmtech product-search API (v2)
+        var result = await TryDmApiV2(item, country);
+        if (result.Count > 0) return result;
+
+        // Fallback: HTML scraper
+        return await TryDmHtml(item, country);
+    }
+
+    private async Task<List<ProductMatch>> TryDmApiV2(GroceryItem item, string country)
+    {
         try
         {
-            var (domain, locale) = country == "DE" ? ("dm.de", "de_DE") : ("dm.nl", "nl_NL");
+            // DM dmtech API — werkt voor zowel NL als DE
+            var locale = country == "DE" ? "de_DE" : "nl_NL";
             var url = $"https://product-search.services.dmtech.com/{locale}/search/crawl" +
-                      $"?q={Uri.EscapeDataString(item.Name)}&pageSize=5&currentPage=0";
+                      $"?q={Uri.EscapeDataString(item.Name)}&pageSize=10&currentPage=0" +
+                      "&type=PRODUCT&searchType=PREDICTIVE";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("dm-app-version", "1.0");
+            req.Headers.TryAddWithoutValidation("Referer", country == "DE" ? "https://www.dm.de/" : "https://www.dm.nl/");
+            req.Headers.TryAddWithoutValidation("Origin", country == "DE" ? "https://www.dm.de" : "https://www.dm.nl");
 
             var response = await _http.SendAsync(req);
-            if (!response.IsSuccessStatusCode) return await TryDmHtml(item, country);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("DM API v2 {Country}: HTTP {Code}", country, response.StatusCode);
+                return [];
+            }
 
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
-            if (!doc.RootElement.TryGetProperty("products", out var products))
-                return await TryDmHtml(item, country);
 
-            foreach (var p in products.EnumerateArray())
+            // Response: { "products": [...] } of { "searchResult": { "products": [...] } }
+            JsonElement productsEl;
+            if (doc.RootElement.TryGetProperty("products", out productsEl)) { /* direct */ }
+            else if (doc.RootElement.TryGetProperty("searchResult", out var sr) &&
+                     sr.TryGetProperty("products", out productsEl)) { /* nested */ }
+            else return [];
+
+            var results = new List<ProductMatch>();
+            foreach (var p in productsEl.EnumerateArray())
             {
+                // Prijs ophalen: price.value of price.formattedValue
                 decimal price = 0;
-                if (p.TryGetProperty("price", out var po) && po.TryGetProperty("value", out var v))
-                    price = v.GetDecimal();
+                if (p.TryGetProperty("price", out var priceEl))
+                {
+                    if (priceEl.TryGetProperty("value", out var val))
+                        price = val.GetDecimal();
+                    else if (priceEl.TryGetProperty("formattedValue", out var fv))
+                    {
+                        var cleaned = fv.GetString()?.Replace("€","").Replace(",",".").Trim() ?? "0";
+                        decimal.TryParse(cleaned, NumberStyles.Any, CultureInfo.InvariantCulture, out price);
+                    }
+                }
                 if (price <= 0) continue;
 
-                var name  = p.TryGetProperty("name", out var n) ? n.GetString() ?? "" : item.Name;
-                bool isBio = name.Contains("bio", StringComparison.OrdinalIgnoreCase);
+                // Controleer of product überhaupt verkrijgbaar is
+                if (p.TryGetProperty("notAvailable", out var na) && na.GetBoolean()) continue;
 
-                _logger.LogInformation("DM {Country}: {Product} → €{Price}", country, name, price);
-                return [new ProductMatch
+                var name     = p.TryGetProperty("name", out var n) ? n.GetString() ?? item.Name : item.Name;
+                var brand    = p.TryGetProperty("brandName", out var b) ? b.GetString() ?? "" : "";
+                var fullName = string.IsNullOrEmpty(brand) ? name : $"{brand} {name}";
+
+                bool isBio   = fullName.Contains("bio", StringComparison.OrdinalIgnoreCase) ||
+                               fullName.Contains("organic", StringComparison.OrdinalIgnoreCase);
+                bool isPromo = p.TryGetProperty("isNew", out var promo) && promo.GetBoolean();
+
+                // Extra check: controleer of DM dit product in sterke categorie heeft
+                bool isDmSterk = DmSterkCategorieen.Any(cat =>
+                    item.Name.Contains(cat, StringComparison.OrdinalIgnoreCase) ||
+                    fullName.Contains(cat, StringComparison.OrdinalIgnoreCase));
+
+                double confidence = ProductMatcher.MatchScore(item.Name, fullName);
+                if (confidence < 0.3) continue; // Te laag — niet relevant
+
+                _logger.LogInformation("DM {Country}: {Product} → €{Price} (conf={Conf:F2}{Sterk})",
+                    country, fullName, price, confidence, isDmSterk ? " ★DM sterk" : "");
+
+                results.Add(new ProductMatch
                 {
-                    StoreName = "DM", Country = country, ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = ProductMatcher.MatchScore(item.Name, name)
-                }];
+                    StoreName       = "DM",
+                    Country         = country,
+                    ProductName     = fullName,
+                    Price           = price,
+                    IsEstimated     = false,
+                    IsPromo         = isPromo,
+                    IsBiologisch    = isBio,
+                    MatchConfidence = confidence,
+                    LastUpdated     = DateTime.UtcNow,
+                });
             }
+
+            // Geef beste match terug (hoogste confidence)
+            var best = results.OrderByDescending(r => r.MatchConfidence).FirstOrDefault();
+            return best != null ? [best] : [];
         }
-        catch (Exception ex) { _logger.LogWarning(ex, "DM API fout voor {Product}", item.Name); }
-        return await TryDmHtml(item, country);
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DM API v2 fout voor {Product}/{Country}", item.Name, country);
+            return [];
+        }
     }
 
     private async Task<List<ProductMatch>> TryDmHtml(GroceryItem item, string country)
@@ -464,31 +543,48 @@ public class DmScraper
         try
         {
             var domain = country == "DE" ? "dm.de" : "dm.nl";
-            var url    = $"https://www.{domain}/search?query={Uri.EscapeDataString(item.Name)}";
-            var resp   = await _http.GetAsync(url);
+            var url    = $"https://www.{domain}/search?query={Uri.EscapeDataString(item.Name)}&searchType=product";
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml");
+
+            var resp = await _http.SendAsync(req);
             if (!resp.IsSuccessStatusCode) return [];
+
             var html = await resp.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
             doc.LoadHtml(html);
-            var priceNode = doc.DocumentNode.SelectSingleNode(
-                "//span[contains(@class,'price') and not(contains(@class,'old'))]");
-            if (priceNode != null)
+
+            // DM gebruikt data-dmid attributen en prijsklassen
+            var priceNodes = doc.DocumentNode.SelectNodes(
+                "//*[contains(@class,'price') and not(contains(@class,'old')) and not(contains(@class,'strike'))]");
+            if (priceNodes == null) return [];
+
+            foreach (var node in priceNodes)
             {
-                var m = System.Text.RegularExpressions.Regex.Match(
-                    priceNode.InnerText.Replace(",", "."), @"\d+\.\d{2}");
-                if (m.Success && decimal.TryParse(m.Value, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p) && p > 0)
-                    return [new ProductMatch
-                    {
-                        StoreName = "DM", Country = country, ProductName = item.Name,
-                        Price = p, IsEstimated = false, MatchConfidence = 0.7
-                    }];
+                var text = node.InnerText.Trim();
+                var m    = System.Text.RegularExpressions.Regex.Match(
+                    text.Replace(",", ".").Replace("&nbsp;", ""), @"\d+\.\d{2}");
+                if (!m.Success) continue;
+                if (!decimal.TryParse(m.Value, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal p)) continue;
+                if (p <= 0 || p > 200) continue;
+
+                _logger.LogInformation("DM HTML {Country}: {Product} → €{Price}", country, item.Name, p);
+                return [new ProductMatch
+                {
+                    StoreName       = "DM",
+                    Country         = country,
+                    ProductName     = item.Name,
+                    Price           = p,
+                    IsEstimated     = false,
+                    MatchConfidence = 0.65,
+                    LastUpdated     = DateTime.UtcNow,
+                }];
             }
         }
-        catch (Exception ex) { _logger.LogError(ex, "DM HTML fout voor {Product}", item.Name); }
+        catch (Exception ex) { _logger.LogError(ex, "DM HTML fout voor {Product}/{Country}", item.Name, country); }
         return [];
     }
-
-    // WordScore vervangen door ProductMatcher.MatchScore
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -513,10 +609,9 @@ public class ReweScraper
     {
         try
         {
-            // marketId weggelaten — nationale prijzen in plaats van één specifieke markt (562223 = Berlijn)
             var url = $"https://shop.rewe.de/api/v7/products" +
                       $"?search={Uri.EscapeDataString(item.Name)}" +
-                      $"&page=1&pageSize=5&sorting=RELEVANCE";
+                      $"&page=1&pageSize=5&marketId=562223&sorting=RELEVANCE";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Referer", "https://shop.rewe.de/");

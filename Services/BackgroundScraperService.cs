@@ -19,7 +19,6 @@ public class BackgroundScraperService : BackgroundService
     private readonly ILogger<BackgroundScraperService> _logger;
     private readonly IConfiguration _config;
     private readonly IServiceProvider _services;
-    private readonly IHttpClientFactory _httpClientFactory;
 
     private static readonly TimeSpan SCRAPE_INTERVAL = TimeSpan.FromHours(6);
     private static readonly TimeSpan REQUEST_DELAY   = TimeSpan.FromMilliseconds(800);
@@ -27,13 +26,11 @@ public class BackgroundScraperService : BackgroundService
     public BackgroundScraperService(
         ILogger<BackgroundScraperService> logger,
         IConfiguration config,
-        IServiceProvider services,
-        IHttpClientFactory httpClientFactory)
+        IServiceProvider services)
     {
-        _logger             = logger;
-        _config             = config;
-        _services           = services;
-        _httpClientFactory  = httpClientFactory;
+        _logger   = logger;
+        _config   = config;
+        _services = services;
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -121,36 +118,35 @@ public class BackgroundScraperService : BackgroundService
         string productName, CancellationToken ct)
     {
         var results = new List<(string, string, decimal, bool)>();
-
-        // Gebruik DI-scope zodat Polly resilience pipelines actief zijn
-        using var scope = _services.CreateScope();
-        var ah    = scope.ServiceProvider.GetRequiredService<AlbertHeijnScraper>();
-        var jumbo = scope.ServiceProvider.GetRequiredService<JumboScraper>();
-        var lidl  = scope.ServiceProvider.GetRequiredService<LidlScraper>();
-        var aldi  = scope.ServiceProvider.GetRequiredService<AldiScraper>();
+        using var http = MakeHttpClient();
 
         var item = new GroceryItem { Name = productName, Id = "", Quantity = 1 };
 
+        // ── NL scrapers ──────────────────────────────────────────────
+        var ahLogger   = _services.GetRequiredService<ILogger<AlbertHeijnScraper>>();
+        var jumboLogger = _services.GetRequiredService<ILogger<JumboScraper>>();
+
         var nlTasks = new List<Task<(string Store, string Country, decimal Price, bool IsPromo)?>>();
 
-        // Albert Heijn via DI-scraper (Polly actief)
+        // Albert Heijn — nu ook in background!
         nlTasks.Add(TryScrapeService("Albert Heijn", "NL", async () =>
         {
-            var matches = await ah.SearchProductAsync(item);
+            using var ahHttp = MakeHttpClient();
+            var scraper = new AlbertHeijnScraper(ahHttp, ahLogger);
+            var matches = await scraper.SearchProductAsync(item);
             var best = matches.OrderByDescending(m => m.MatchConfidence).FirstOrDefault();
             return best != null && best.Price > 0 ? (best.Price, best.IsPromo) : ((decimal, bool)?)null;
         }));
 
-        // Jumbo via DI-scraper (Polly actief)
+        // Jumbo — nu ook in background!
         nlTasks.Add(TryScrapeService("Jumbo", "NL", async () =>
         {
-            var matches = await jumbo.SearchProductAsync(item);
+            using var jumboHttp = MakeHttpClient();
+            var scraper = new JumboScraper(jumboHttp, jumboLogger);
+            var matches = await scraper.SearchProductAsync(item);
             var best = matches.OrderByDescending(m => m.MatchConfidence).FirstOrDefault();
             return best != null && best.Price > 0 ? (best.Price, best.IsPromo) : ((decimal, bool)?)null;
         }));
-
-        // Overige scrapers via gedeelde HttpClient (beheerd door IHttpClientFactory)
-        using var http = _httpClientFactory.CreateClient("scraper");
 
         // Lidl NL
         nlTasks.Add(TryScrape("Lidl", "NL", () => ScrapeLidl(http, productName, "NL")));
@@ -168,6 +164,25 @@ public class BackgroundScraperService : BackgroundService
         nlTasks.Add(TryScrape("Aldi Süd", "DE", () => ScrapeAldi(http, productName, "DE")));
         nlTasks.Add(TryScrape("Rewe",     "DE", () => ScrapeRewe(http, productName)));
         nlTasks.Add(TryScrape("Edeka",    "DE", () => ScrapeEdeka(http, productName)));
+
+        // ── DM scrapers (NL + DE) — drogist, vaak goedkoopst voor verzorging/wassen ──
+        var dmLogger = _services.GetRequiredService<ILogger<DmScraper>>();
+        nlTasks.Add(TryScrapeService("DM", "NL", async () =>
+        {
+            var dmHttp  = _factory.CreateClient("scraper");
+            var scraper = new DmScraper(dmHttp, dmLogger);
+            var matches = await scraper.SearchProductAsync(item, "NL");
+            var match   = matches.FirstOrDefault();
+            return match != null && match.Price > 0 ? (match.Price, match.IsPromo) : ((decimal, bool)?)null;
+        }));
+        nlTasks.Add(TryScrapeService("DM", "DE", async () =>
+        {
+            var dmHttp  = _factory.CreateClient("scraper");
+            var scraper = new DmScraper(dmHttp, dmLogger);
+            var matches = await scraper.SearchProductAsync(item, "DE");
+            var match   = matches.FirstOrDefault();
+            return match != null && match.Price > 0 ? (match.Price, match.IsPromo) : ((decimal, bool)?)null;
+        }));
 
         var all = await Task.WhenAll(nlTasks);
         foreach (var r in all)
@@ -349,7 +364,7 @@ public class BackgroundScraperService : BackgroundService
     // ─────────────────────────────────────────────────────────────────
     private static async Task<(decimal, bool)> ScrapeRewe(HttpClient http, string query)
     {
-        var url = $"https://shop.rewe.de/api/v7/products?search={Uri.EscapeDataString(query)}&page=1&pageSize=5";
+        var url = $"https://shop.rewe.de/api/v7/products?search={Uri.EscapeDataString(query)}&page=1&pageSize=5&marketId=562223";
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.TryAddWithoutValidation("Referer", "https://shop.rewe.de/");
         var resp = await http.SendAsync(req);
@@ -446,11 +461,9 @@ public class BackgroundScraperService : BackgroundService
         return null;
     }
 
-    // HttpClient voor scraping via IHttpClientFactory (vermijdt socket exhaustion)
-    // Geconfigureerd als named client "scraper" in Program.cs
-    private static HttpClient ConfigureScraperClient(HttpClient client)
+    private static HttpClient MakeHttpClient()
     {
-        client.Timeout = TimeSpan.FromSeconds(15);
+        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
         client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
         client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
@@ -466,8 +479,7 @@ public class BackgroundScraperService : BackgroundService
         try
         {
             using var http = MakeSupabaseClient(supabaseUrl, key);
-            // Beperk tot top-500 meest recente producten voor snellere scrapes
-            var resp = await http.GetAsync($"{supabaseUrl}/rest/v1/products?select=id,name&limit=500&order=created_at.desc");
+            var resp = await http.GetAsync($"{supabaseUrl}/rest/v1/products?select=id,name&limit=1000");
             if (!resp.IsSuccessStatusCode)
             {
                 _logger.LogError("Supabase producten fout: {Status}", resp.StatusCode);
