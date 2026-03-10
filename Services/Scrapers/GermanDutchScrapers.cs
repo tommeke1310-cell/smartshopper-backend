@@ -450,7 +450,7 @@ public class DmScraper
             // DM dmtech API — werkt voor zowel NL als DE
             var locale = country == "DE" ? "de_DE" : "nl_NL";
             var url = $"https://product-search.services.dmtech.com/{locale}/search/crawl" +
-                      $"?q={Uri.EscapeDataString(item.Name)}&pageSize=10&currentPage=0" +
+                      $"?q={Uri.EscapeDataString(item.BuildSearchQuery())}&pageSize=10&currentPage=0" +
                       "&type=PRODUCT&searchType=PREDICTIVE";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
@@ -508,10 +508,20 @@ public class DmScraper
                     fullName.Contains(cat, StringComparison.OrdinalIgnoreCase));
 
                 double confidence = ProductMatcher.MatchScore(item.Name, fullName);
-                if (confidence < 0.3) continue; // Te laag — niet relevant
+                if (confidence < item.MinConfidence) continue; // Te laag — niet relevant
 
                 _logger.LogInformation("DM {Country}: {Product} → €{Price} (conf={Conf:F2}{Sterk})",
                     country, fullName, price, confidence, isDmSterk ? " ★DM sterk" : "");
+
+                // Merkvoorkeur filter: bij "huismerk" → filter A-merken eruit (hoge prijs + bekende naam)
+                // Bij "a-merk" → filter resultaten zonder merk-indicatie eruit
+                bool passesFilter = item.BrandPreference switch
+                {
+                    "huismerk" => !IsKnownAMerk(fullName),
+                    "a-merk"   => IsKnownAMerk(fullName) || confidence >= 0.75,
+                    _           => true,
+                };
+                if (!passesFilter) continue;
 
                 results.Add(new ProductMatch
                 {
@@ -543,7 +553,7 @@ public class DmScraper
         try
         {
             var domain = country == "DE" ? "dm.de" : "dm.nl";
-            var url    = $"https://www.{domain}/search?query={Uri.EscapeDataString(item.Name)}&searchType=product";
+            var url    = $"https://www.{domain}/search?query={Uri.EscapeDataString(item.BuildSearchQuery())}&searchType=product";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml");
@@ -585,6 +595,22 @@ public class DmScraper
         catch (Exception ex) { _logger.LogError(ex, "DM HTML fout voor {Product}/{Country}", item.Name, country); }
         return [];
     }
+
+    /// <summary>Detecteer bekende A-merken op naam</summary>
+    private static bool IsKnownAMerk(string name)
+    {
+        var n = name.ToLowerInvariant();
+        string[] aMarken = [
+            "head & shoulders","head and shoulders","pantene","herbal essences",
+            "elvive","l'oreal","garnier","nivea","dove","rexona","axe","gillette",
+            "oral-b","colgate","sensodyne","listerine","always","tampax","pampers",
+            "ariel","persil","dash","lenor","fairy","ajax","mr proper","domestos",
+            "schwarzkopf","tresemmé","john frieda","cetaphil","la roche","vichy",
+            "neutrogena","olay","vaseline","johnson & johnson","aveeno","bioderma",
+            "coca-cola","pepsi","red bull","monster","heinz","knorr",
+        ];
+        return aMarken.Any(m => n.Contains(m));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -610,7 +636,7 @@ public class ReweScraper
         try
         {
             var url = $"https://shop.rewe.de/api/v7/products" +
-                      $"?search={Uri.EscapeDataString(item.Name)}" +
+                      $"?search={Uri.EscapeDataString(item.BuildSearchQuery())}" +
                       $"&page=1&pageSize=5&marketId=562223&sorting=RELEVANCE";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
@@ -667,7 +693,7 @@ public class ReweScraper
         try
         {
             var response = await _http.GetAsync(
-                $"https://www.rewe.de/suche/?search={Uri.EscapeDataString(item.Name)}");
+                $"https://www.rewe.de/suche/?search={Uri.EscapeDataString(item.BuildSearchQuery())}");
             if (!response.IsSuccessStatusCode) return [];
             var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();
@@ -716,7 +742,7 @@ public class EdekaScraper
         try
         {
             var url = $"https://www.edeka.de/api/search/v1/products" +
-                      $"?q={Uri.EscapeDataString(item.Name)}&page=0&size=5";
+                      $"?q={Uri.EscapeDataString(item.BuildSearchQuery())}&page=0&size=5";
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Referer", "https://www.edeka.de/");
 
@@ -767,7 +793,7 @@ public class EdekaScraper
         try
         {
             var response = await _http.GetAsync(
-                $"https://www.edeka.de/produkte/suchergebnis.jsp?query={Uri.EscapeDataString(item.Name)}");
+                $"https://www.edeka.de/produkte/suchergebnis.jsp?query={Uri.EscapeDataString(item.BuildSearchQuery())}");
             if (!response.IsSuccessStatusCode) return [];
             var html = await response.Content.ReadAsStringAsync();
             var doc  = new HtmlDocument();

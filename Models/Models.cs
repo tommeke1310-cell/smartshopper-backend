@@ -49,6 +49,9 @@ namespace SmartShopper.API.Models
         public bool BudgetWaarschuwing { get; set; } = true;
     }
 
+    /// <summary>Merkvoorkeur per product: a-merk | huismerk | maakt-niet-uit</summary>
+    public enum BrandPreference { MaaktNietUit, AMerk, Huismerk }
+
     public class GroceryItem
     {
         public string Id { get; set; } = "";
@@ -56,6 +59,31 @@ namespace SmartShopper.API.Models
         public int Quantity { get; set; } = 1;
         public string Category { get; set; } = "";
         public string Unit { get; set; } = "stuk";
+
+        // Merkvoorkeur — stuurde vanuit de app, beïnvloedt zoekquery
+        // "a-merk" → zoek op merknaam, filter huismerk resultaten
+        // "huismerk" → voeg "huismerk" of "AH Basic" etc. toe aan query
+        // "maakt-niet-uit" → geen filter (standaard)
+        public string BrandPreference { get; set; } = "maakt-niet-uit";
+
+        /// <summary>Pas de zoekquery aan op basis van merkvoorkeur</summary>
+        public string BuildSearchQuery()
+        {
+            return BrandPreference switch
+            {
+                "a-merk"    => Name, // originele naam, scrapers filteren op hoge confidence
+                "huismerk"  => Name + " huismerk",
+                _            => Name,
+            };
+        }
+
+        /// <summary>Minimum matchconfidence die we accepteren</summary>
+        public double MinConfidence => BrandPreference switch
+        {
+            "a-merk"   => 0.65, // Hogere drempel: liever geen resultaat dan verkeerd merk
+            "huismerk" => 0.45, // Iets lagere drempel, huismerk heeft afwijkende namen
+            _           => 0.30,
+        };
     }
 
     // ─── PRODUCT MATCH ────────────────────────────────────────────────
