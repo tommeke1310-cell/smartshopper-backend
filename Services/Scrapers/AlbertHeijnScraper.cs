@@ -21,9 +21,8 @@ public class AlbertHeijnScraper
     {
         _http   = http;
         _logger = logger;
-        // Website headers, niet mobile — werkt beter vanaf datacenter IPs
-        // Appie mobile app User-Agent — vermijdt datacenter IP-blokkade beter dan browser UA
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",    "Appie/8.22.3");
+        // Appie mobile app User-Agent (controleer Play Store voor meest recente versie)
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",    "Appie/8.47.2");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Content-Type",  "application/json");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept",        "application/json");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language","nl-NL,nl;q=0.9");
@@ -244,25 +243,3 @@ public class AlbertHeijnScraper
     // WordScore vervangen door ProductMatcher.MatchScore (zie ProductMatcher.cs)
 }
 
-public static class ProxyConfig
-{
-    public static HttpClient CreateClient(string envVarName, ILogger logger)
-    {
-        var proxyUrl = Environment.GetEnvironmentVariable(envVarName);
-        if (!string.IsNullOrEmpty(proxyUrl))
-        {
-            try
-            {
-                var handler = new HttpClientHandler
-                {
-                    Proxy = new System.Net.WebProxy(proxyUrl, true),
-                    UseProxy = true,
-                    ServerCertificateCustomValidationCallback = (_, _, _, _) => true
-                };
-                return new HttpClient(handler);
-            }
-            catch (Exception ex) { logger.LogWarning(ex, "Proxy config mislukt voor {Env}", envVarName); }
-        }
-        return new HttpClient();
-    }
-}

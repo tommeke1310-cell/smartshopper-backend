@@ -240,34 +240,59 @@ public class SharedListService
 
     // âââ LID UITNODIGEN ââââââââââââââââââââââââââââââââââââââââââ
 
+    // ─── LID UITNODIGEN ──────────────────────────────────────────────
+    // Stap 1: zoek userId op via e-mailadres in profiles tabel
+    // Stap 2: voeg userId toe aan member_ids via Supabase RPC
+    // Opmerking: de gebruiker moet al een account hebben.
+    // Voor uitnodiging van nieuwe gebruikers: gebruik Supabase Auth invite
+    // via de frontend: supabase.auth.admin.inviteUserByEmail()
     public async Task<bool> InviteMemberAsync(string listId, InviteMemberRequest request)
     {
         try
         {
-            // Lookup userId via email in Supabase auth
+            if (string.IsNullOrWhiteSpace(request.InviteEmail))
+            {
+                _logger.LogWarning("InviteMember: leeg e-mailadres ontvangen voor lijst {ListId}", listId);
+                return false;
+            }
+
+            // Lookup userId via email in Supabase profiles tabel
             var emailResp = await _http.GetAsync(
                 $"{_supabaseUrl}/rest/v1/profiles?email=eq.{Uri.EscapeDataString(request.InviteEmail)}&select=id");
-            if (!emailResp.IsSuccessStatusCode) return false;
+            if (!emailResp.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("InviteMember: profiles lookup mislukt ({Status}) voor {Email}", emailResp.StatusCode, request.InviteEmail);
+                return false;
+            }
 
             var emailJson = await emailResp.Content.ReadAsStringAsync();
             using var emailDoc = JsonDocument.Parse(emailJson);
-            if (emailDoc.RootElement.GetArrayLength() == 0) return false;
+            if (emailDoc.RootElement.GetArrayLength() == 0)
+            {
+                _logger.LogInformation("InviteMember: geen account gevonden voor {Email} — gebruiker moet eerst registreren", request.InviteEmail);
+                return false; // Gebruiker bestaat nog niet — frontend moet Supabase invite sturen
+            }
 
             var newMemberId = emailDoc.RootElement[0].GetProperty("id").GetString() ?? "";
             if (string.IsNullOrEmpty(newMemberId)) return false;
 
-            // Append userId to member_ids array via Supabase RPC
+            // Voeg userId toe via Supabase RPC
             var rpcResp = await _http.PostAsJsonAsync($"{_supabaseUrl}/rest/v1/rpc/add_list_member", new
             {
                 p_list_id  = listId,
                 p_user_id  = newMemberId,
             });
 
+            if (rpcResp.IsSuccessStatusCode)
+                _logger.LogInformation("InviteMember: {Email} (id:{UserId}) toegevoegd aan lijst {ListId}", request.InviteEmail, newMemberId, listId);
+            else
+                _logger.LogWarning("InviteMember: RPC add_list_member mislukt: {Status}", rpcResp.StatusCode);
+
             return rpcResp.IsSuccessStatusCode;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "InviteMemberAsync fout");
+            _logger.LogError(ex, "InviteMemberAsync fout voor lijst {ListId}", listId);
             return false;
         }
     }

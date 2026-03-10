@@ -8,12 +8,17 @@ public class RoutingService
     private readonly HttpClient _http;
     private readonly ILogger<RoutingService> _logger;
     private readonly string? _mapsKey;
+    private readonly IMemoryCache _cache;
 
-    public RoutingService(HttpClient http, ILogger<RoutingService> logger, IConfiguration config)
+    // Cache Maps-resultaten 30 min per locatie (bespaart quota)
+    private static readonly TimeSpan MapsCacheTtl = TimeSpan.FromMinutes(30);
+
+    public RoutingService(HttpClient http, ILogger<RoutingService> logger, IConfiguration config, IMemoryCache cache)
     {
         _http = http;
         _logger = logger;
         _mapsKey = config["GoogleMaps:ApiKey"];
+        _cache = cache;
     }
 
     // ── Winkels ophalen met aparte quota per land ──────────────────
@@ -26,6 +31,14 @@ public class RoutingService
 
         // Gebruik minimaal 30km zodat grensplaatsen altijd gevonden worden
         int effectiveRadius = Math.Max(radiusMeter, 30000);
+
+        // Cache-sleutel afgerond op ~500m
+        var cacheKey = $"maps:{Math.Round(lat, 3)}:{Math.Round(lng, 3)}:{effectiveRadius}";
+        if (_cache.TryGetValue(cacheKey, out List<StoreTemplate>? cached) && cached != null)
+        {
+            _logger.LogInformation("Maps cache hit voor locatie {Lat},{Lng}", Math.Round(lat, 3), Math.Round(lng, 3));
+            return cached;
+        }
 
         var stores = new List<StoreTemplate>();
         string[] nlChains = { "Albert Heijn", "Jumbo", "Lidl", "Aldi", "Plus", "Dirk", "Vomar", "Hoogvliet", "Coop", "Dekamarkt" };
@@ -70,9 +83,11 @@ public class RoutingService
             }
         }
 
-        await SearchChains(nlChains);
-        await SearchChains(beChains);
-        await SearchChains(deChains);
+        // ── Parallel zoeken per land (was sequentieel — nu 3x sneller) ──
+        await Task.WhenAll(
+            SearchChains(nlChains),
+            SearchChains(beChains),
+            SearchChains(deChains));
 
         // Deduplicate en pas aparte quota toe per land: 20 NL + 10 BE + 10 DE
         var deduped = stores.GroupBy(s => $"{s.Chain}|{Math.Round(s.Latitude, 3)}|{Math.Round(s.Longitude, 3)}")
@@ -95,7 +110,12 @@ public class RoutingService
             "Winkels gevonden: {NL} NL, {BE} BE, {DE} DE (radius {Radius}km)",
             nlStores.Count, beStores.Count, deStores.Count, effectiveRadius / 1000);
 
-        return nlStores.Concat(beStores).Concat(deStores).ToList();
+        var allStores = nlStores.Concat(beStores).Concat(deStores).ToList();
+
+        // Sla op in cache (30 min)
+        _cache.Set(cacheKey, allStores, MapsCacheTtl);
+
+        return allStores;
     }
 
     // Haversine afstand in km (voor sortering dichtstbijzijnde winkels)
@@ -149,17 +169,25 @@ public class RoutingService
         return (Math.Round(distKm, 1), estMin, Math.Round(estFuel, 2));
     }
 
+    // Verbeterde landdetectie op basis van nauwkeurige bounding boxes
+    // Volgorde: specifieke grenscases eerst, dan algemene gebieden
     private static string DetectCountry(double lat, double lng)
     {
-        if (lat >= 52.00 && lng >= 3.36 && lng <= 7.22) return "NL";
-        if (lat >= 50.75 && lat < 52.00 && lng >= 5.65 && lng < 6.00) return "NL";
-        if (lat >= 50.75 && lat < 52.00 && lng >= 6.00 && lng <= 7.22) return "DE";
-        if (lat >= 51.30 && lat < 52.00 && lng >= 4.50 && lng < 5.65) return "NL";
-        if (lat >= 50.75 && lat < 51.30 && lng >= 5.50 && lng < 5.65)
-            return lat >= 50.84 && lng >= 5.67 ? "NL" : "BE";
-        if (lat >= 50.75 && lat < 51.30 && lng >= 3.36 && lng < 5.50) return "BE";
-        if (lat >= 51.10 && lat < 51.30 && lng >= 3.36 && lng < 4.50) return "BE";
-        if (lat >= 49.50 && lat < 50.75 && lng >= 2.54 && lng <= 6.40) return "BE";
+        // ── Duitsland (DE) — rechts van NL grenslijn ──────────────────
+        // Ruwweg: oost van ~6.10-6.20 en bepaalde lat-banden
+        if (lat >= 51.05 && lat <= 52.55 && lng >= 6.85) return "DE"; // Achterhoek-grens en noordelijker
+        if (lat >= 50.70 && lat <  51.05 && lng >= 6.20) return "DE"; // Limburg-grens / Aken-regio
+
+        // ── België (BE) ────────────────────────────────────────────────
+        // Globale BE box: lat 49.50-51.50, lng 2.54-6.40
+        // Maar Zeeuws-Vlaanderen (NL) zit ook laag — check expliciet
+        if (lat >= 51.25 && lat <= 51.50 && lng >= 3.36 && lng <= 4.25) return "NL"; // Zeeuws-Vlaanderen
+        if (lat >= 49.50 && lat <  51.50 && lng >= 2.54 && lng <= 6.40) return "BE";
+
+        // ── Nederland (NL) — alles daarboven ──────────────────────────
+        if (lat >= 50.75 && lat <= 53.55 && lng >= 3.36 && lng <= 7.22) return "NL";
+
+        // Fallback
         return "NL";
     }
 }

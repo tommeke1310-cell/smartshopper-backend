@@ -104,6 +104,16 @@ AddScraperResilience(builder.Services.AddHttpClient<PlusScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<DirkScraper>());
 AddScraperResilience(builder.Services.AddHttpClient<DelhaizeScraper>());
 
+// Named client voor BackgroundScraperService (vervangt new HttpClient() anti-pattern)
+builder.Services.AddHttpClient("scraper", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(15);
+    client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36");
+    client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/html, */*");
+    client.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "nl-NL,nl;q=0.9,de;q=0.8");
+});
+
 // ─── Business services ───────────────────────────────────────────
 builder.Services.AddHttpClient<CompareService>(c => c.Timeout = TimeSpan.FromSeconds(30));
 builder.Services.AddHttpClient<IntelligenceService>(c => c.Timeout = TimeSpan.FromSeconds(10));
@@ -142,7 +152,8 @@ builder.Services.AddHttpClient<BackgroundScraperService>(c => c.Timeout = TimeSp
 // ─── Cache + Memory ──────────────────────────────────────────────
 builder.Services.AddMemoryCache();
 
-// ─── Rate Limiting (10 compare-requests/minuut per IP) ───────────
+// ─── Rate Limiting (30 compare-requests/minuut per IP) ───────────
+// Verhoogd van 10 naar 30: gezinnen delen vaak één IP via NAT
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = 429;
@@ -152,7 +163,7 @@ builder.Services.AddRateLimiter(options =>
             factory: _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
             {
                 Window      = TimeSpan.FromMinutes(1),
-                PermitLimit = 10,
+                PermitLimit = 30,
                 QueueLimit  = 0
             }));
 });
@@ -197,6 +208,28 @@ if (!string.IsNullOrWhiteSpace(apiSecretKey))
 
 app.UseAuthorization();
 app.UseRateLimiter();
+
+// ─── Input-validatie: max lengte op productnamen ──────────────────
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/api/compare") && context.Request.Method == "POST")
+    {
+        // Body lezen voor validatie — daarna terugspoelen zodat controllers het ook kunnen lezen
+        context.Request.EnableBuffering();
+        var body = await new System.IO.StreamReader(context.Request.Body, leaveOpen: true).ReadToEndAsync();
+        context.Request.Body.Position = 0;
+
+        // Simpele check: productnaam mag niet langer zijn dan 120 tekens
+        if (body.Length > 50_000)
+        {
+            context.Response.StatusCode = 400;
+            await context.Response.WriteAsJsonAsync(new { error = "Request te groot" });
+            return;
+        }
+    }
+    await next();
+});
+
 app.MapControllers();
 
 app.MapGet("/health", () => new

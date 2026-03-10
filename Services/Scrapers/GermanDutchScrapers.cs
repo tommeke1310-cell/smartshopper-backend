@@ -513,9 +513,10 @@ public class ReweScraper
     {
         try
         {
+            // marketId weggelaten — nationale prijzen in plaats van één specifieke markt (562223 = Berlijn)
             var url = $"https://shop.rewe.de/api/v7/products" +
                       $"?search={Uri.EscapeDataString(item.Name)}" +
-                      $"&page=1&pageSize=5&marketId=562223&sorting=RELEVANCE";
+                      $"&page=1&pageSize=5&sorting=RELEVANCE";
 
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Referer", "https://shop.rewe.de/");

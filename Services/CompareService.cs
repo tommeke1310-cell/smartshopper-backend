@@ -22,7 +22,11 @@ public class CompareService
     private readonly ReweScraper        _rewe;
     private readonly EdekaScraper       _edeka;
     private readonly RoutingService     _routing;
+    private readonly IMemoryCache       _cache;
     private readonly ILogger<CompareService> _logger;
+
+    // Cache TTL voor vergelijkingsresultaten (10 minuten)
+    private static readonly TimeSpan CompareCacheTtl = TimeSpan.FromMinutes(10);
 
     // Fallback winkels als Google Maps niet beschikbaar is (gesorteerd op relevantie NL)
     private static readonly List<StoreTemplate> FallbackStores =
@@ -66,6 +70,7 @@ public class CompareService
         ReweScraper        rewe,
         EdekaScraper       edeka,
         RoutingService     routing,
+        IMemoryCache       cache,
         ILogger<CompareService> logger)
     {
         _ah       = ah;
@@ -79,12 +84,21 @@ public class CompareService
         _rewe     = rewe;
         _edeka    = edeka;
         _routing  = routing;
+        _cache    = cache;
         _logger   = logger;
     }
 
     public async Task<CompareResult> ComparePricesAsync(CompareRequest request)
     {
         var result = new CompareResult();
+
+        // ── Cache-sleutel op basis van producten + afgeronde locatie (±500m) ──
+        var cacheKey = BuildCacheKey(request);
+        if (_cache.TryGetValue(cacheKey, out CompareResult? cached) && cached != null)
+        {
+            _logger.LogInformation("Cache hit voor vergelijking ({Key})", cacheKey[..20]);
+            return cached;
+        }
 
         // ── Validatie ─────────────────────────────────────────────────
         if (request.UserLatitude == 0 && request.UserLongitude == 0)
@@ -181,7 +195,26 @@ public class CompareService
             result.BestDeal?.Store.Chain ?? "?",
             result.BestDeal?.TotalCost ?? 0);
 
+        // Sla op in cache (alleen als er geldige resultaten zijn)
+        if (result.Stores.Count > 0)
+            _cache.Set(cacheKey, result, CompareCacheTtl);
+
         return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Cache-sleutel: hash van productnamen + afgeronde locatie
+    // ─────────────────────────────────────────────────────────────────
+    private static string BuildCacheKey(CompareRequest req)
+    {
+        var items = string.Join("|", req.Items
+            .OrderBy(i => i.Name)
+            .Select(i => $"{i.Name.ToLower()}:{i.Quantity}"));
+        // Locatie afgerond op ~500m (3 decimalen ≈ 111m)
+        var lat = Math.Round(req.UserLatitude,  3);
+        var lng = Math.Round(req.UserLongitude, 3);
+        var flags = $"BE:{req.IncludeBelgium}|DE:{req.IncludeGermany}|KM:{req.MaxDistanceKm}";
+        return $"compare:{lat}:{lng}:{flags}:{items}";
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -334,15 +367,25 @@ public class CompareService
         out int matched, out int total)
     {
         matched = 0;
-        total   = products.Count;
-        // Voorkeur-matching is indicatief — echte match vereist productdata labels
-        // Hier tellen we winkels die bekend zijn voor vegan/bio producten
+        total   = 0;
+
+        // Alleen tellen als er daadwerkelijk een voorkeur actief is
+        bool hasAnyPref = prefs.VoorkeurBiologisch || prefs.IsVegan || prefs.IsVegetarisch
+                       || prefs.IsGlutenvrij || prefs.IsLactosevrij || prefs.IsHalal;
+        if (!hasAnyPref) return; // Geen actieve voorkeuren → geen zinvolle score
+
         foreach (var p in products)
         {
+            if (p.Price <= 0) continue; // Sla niet-gevonden producten over
+            total++;
             var name = p.ProductName.ToLower();
-            if (prefs.VoorkeurBiologisch && (name.Contains("bio") || name.Contains("biologisch"))) matched++;
-            else if (prefs.IsVegan && name.Contains("vegan")) matched++;
-            else matched++; // Standaard: product beschikbaar = match
+
+            bool isMatch = false;
+            if (prefs.VoorkeurBiologisch && (name.Contains("bio") || name.Contains("biologisch"))) isMatch = true;
+            if (prefs.IsVegan  && name.Contains("vegan"))  isMatch = true;
+            if (prefs.IsHalal  && name.Contains("halal"))  isMatch = true;
+
+            if (isMatch) matched++;
         }
     }
 
@@ -373,22 +416,19 @@ public class CompareService
 
             if (cheapest == null || cheapestPrice >= 3.00m) continue;
 
-            // Suggereer bulk (2 of 3 stuks) als prijs laag genoeg is
-            int suggestedQty = cheapestPrice < 1.50m ? 3 : 2;
-            decimal savings  = cheapestPrice * (suggestedQty - 1) * 0.05m; // 5% fictieve besparing
-
-            if (savings < 0.05m) continue;
+            // Suggereer bulk (2 stuks) voor goedkope basisproducten
+            int suggestedQty = 2;
 
             suggestions.Add(new BulkSuggestion
             {
-                ProductName    = item.Name,
-                CurrentQty     = 1,
-                SuggestedQty   = suggestedQty,
-                CheapestStore  = cheapest.Store.Chain,
+                ProductName     = item.Name,
+                CurrentQty      = 1,
+                SuggestedQty    = suggestedQty,
+                CheapestStore   = cheapest.Store.Chain,
                 CheapestCountry = cheapest.Store.Country,
-                PricePerUnit   = cheapestPrice,
-                SavingsEur     = Math.Round(savings, 2),
-                Tip            = $"Koop {suggestedQty}x bij {cheapest.Store.Chain} en bespaar op je volgende boodschappen",
+                PricePerUnit    = cheapestPrice,
+                SavingsEur      = 0, // Geen fictieve besparing — echte bulk-prijsdata ontbreekt
+                Tip             = $"{item.Name} is goedkoop bij {cheapest.Store.Chain} (€{cheapestPrice:F2}/stuk) — overweeg meerdere te kopen als je ze vaker gebruikt.",
             });
 
             if (suggestions.Count >= 3) break;

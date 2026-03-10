@@ -14,13 +14,19 @@ public class IntelligenceService
     private readonly ILogger<IntelligenceService> _logger;
     private readonly string _supabaseUrl;
     private readonly string _supabaseKey;
+    private readonly IMemoryCache _cache;
 
-    public IntelligenceService(HttpClient http, ILogger<IntelligenceService> logger, IConfiguration config)
+    // Cache TTLs
+    private static readonly TimeSpan RecommendationCacheTtl = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan PatternCacheTtl         = TimeSpan.FromMinutes(5);
+
+    public IntelligenceService(HttpClient http, ILogger<IntelligenceService> logger, IConfiguration config, IMemoryCache cache)
     {
         _http = http;
         _logger = logger;
         _supabaseUrl = config["Supabase:Url"] ?? "";
         _supabaseKey = config["Supabase:ServiceKey"] ?? config["Supabase:AnonKey"] ?? "";
+        _cache = cache;
     }
 
     // ── Gedrag opslaan ────────────────────────────────────────────
@@ -51,8 +57,11 @@ public class IntelligenceService
                 quantity     = evt.Quantity,
                 session_id   = evt.SessionId,
             });
-            await _http.SendAsync(req);
-            _logger.LogInformation("[Behavior] {User} → {Action} {Product}", userId, evt.Action, evt.ProductName);
+            var resp = await _http.SendAsync(req);
+            if (!resp.IsSuccessStatusCode)
+                _logger.LogWarning("[Behavior] Opslaan mislukt: {Status} voor {User}/{Action}", resp.StatusCode, userId, evt.Action);
+            else
+                _logger.LogInformation("[Behavior] {User} → {Action} {Product}", userId, evt.Action, evt.ProductName);
         }
         catch (Exception ex) { _logger.LogWarning(ex, "TrackBehavior mislukt"); }
     }
@@ -128,6 +137,11 @@ public class IntelligenceService
     public async Task<List<ProductRecommendation>> GetRecommendationsAsync(
         string userId, double lat, double lng)
     {
+        // Cache per userId — voorkomt herhaalde Supabase queries bij pagina-refresh
+        var cacheKey = $"recs:{userId}:{Math.Round(lat, 2)}:{Math.Round(lng, 2)}";
+        if (_cache.TryGetValue(cacheKey, out List<ProductRecommendation>? cached) && cached != null)
+            return cached;
+
         try
         {
             var url = $"{_supabaseUrl}/rest/v1/rpc/get_recommendations";
@@ -169,6 +183,7 @@ public class IntelligenceService
                 recs.AddRange(popular.Take(10 - recs.Count));
             }
 
+            _cache.Set(cacheKey, recs, RecommendationCacheTtl);
             return recs;
         }
         catch (Exception ex)
@@ -181,6 +196,11 @@ public class IntelligenceService
     // ── Shoppatroon analyse ───────────────────────────────────────
     public async Task<ShoppingPattern> AnalyzePatternAsync(string userId)
     {
+        // Cache 5 min per gebruiker
+        var cacheKey = $"pattern:{userId}";
+        if (_cache.TryGetValue(cacheKey, out ShoppingPattern? cached) && cached != null)
+            return cached;
+
         try
         {
             // Haal aankopen van afgelopen 90 dagen op
@@ -204,7 +224,7 @@ public class IntelligenceService
                 .OrderByDescending(g => g.Count())
                 .ToDictionary(g => g.Key, g => g.Count());
 
-            return new ShoppingPattern
+            var pattern = new ShoppingPattern
             {
                 TotalSpent90Days   = totalSpent,
                 TotalSavings90Days = totalSavings,
@@ -214,6 +234,9 @@ public class IntelligenceService
                 WeeklyBudget       = totalSpent / 13,  // 90 dagen ≈ 13 weken
                 AvgSavingsPerTrip  = purchases.Count > 0 ? totalSavings / purchases.Count : 0,
             };
+
+            _cache.Set(cacheKey, pattern, PatternCacheTtl);
+            return pattern;
         }
         catch (Exception ex)
         {

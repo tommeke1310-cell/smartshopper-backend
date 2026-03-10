@@ -9,14 +9,19 @@ public class JumboScraper
 {
     private readonly HttpClient            _http;
     private readonly ILogger<JumboScraper> _logger;
+    private readonly IMemoryCache          _cache;
+
+    // Jumbo cache TTL: 30 min (voorkomt blok-kade bij herhaalde requests)
+    private static readonly TimeSpan JumboCacheTtl = TimeSpan.FromMinutes(30);
 
     private static readonly HashSet<string> HuisMerkPrefixes = new(StringComparer.OrdinalIgnoreCase)
         { "jumbo", "jumbo biologisch", "jumbo puur & lekker", "jumbo fairtrade" };
 
-    public JumboScraper(HttpClient http, ILogger<JumboScraper> logger)
+    public JumboScraper(HttpClient http, ILogger<JumboScraper> logger, IMemoryCache cache)
     {
         _http   = http;
         _logger = logger;
+        _cache  = cache;
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "text/html,application/json,*/*");
@@ -28,13 +33,30 @@ public class JumboScraper
     {
         // Normaliseer zoekterm
         item = new GroceryItem { Name = ProductMatcher.NormalizeQueryForSearch(item.Name), Quantity = item.Quantity, Unit = item.Unit, Category = item.Category, Id = item.Id };
+
+        // Check cache eerst (vermijdt IP-blokkades bij herhaalde requests)
+        var cacheKey = $"jumbo:{item.Name.ToLower()}";
+        if (_cache.TryGetValue(cacheKey, out List<ProductMatch>? cached) && cached != null)
+        {
+            _logger.LogInformation("Jumbo cache hit voor '{Product}'", item.Name);
+            return cached;
+        }
+
         // Stap 1: webshop JSON API
         var results = await TryWebshopApi(item);
-        if (results.Count > 0) return results;
+        if (results.Count > 0)
+        {
+            _cache.Set(cacheKey, results, JumboCacheTtl);
+            return results;
+        }
 
         // Stap 2: HTML pagina parsen
         results = await TryHtmlScrape(item);
-        if (results.Count > 0) return results;
+        if (results.Count > 0)
+        {
+            _cache.Set(cacheKey, results, JumboCacheTtl);
+            return results;
+        }
 
         _logger.LogWarning("Jumbo: geen resultaten voor '{Product}'", item.Name);
         return [];

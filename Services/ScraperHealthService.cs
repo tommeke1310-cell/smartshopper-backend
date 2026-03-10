@@ -56,22 +56,35 @@ public class ScraperHealthService
         _logger.LogInformation("Scraper health check gestart...");
 
         using var scope = _services.CreateScope();
-        var ah    = scope.ServiceProvider.GetRequiredService<AlbertHeijnScraper>();
-        var jumbo = scope.ServiceProvider.GetRequiredService<JumboScraper>();
-        var lidl  = scope.ServiceProvider.GetRequiredService<LidlScraper>();
-        var aldi  = scope.ServiceProvider.GetRequiredService<AldiScraper>();
-        var plus  = scope.ServiceProvider.GetRequiredService<PlusScraper>();
-        var dirk  = scope.ServiceProvider.GetRequiredService<DirkScraper>();
+        var ah       = scope.ServiceProvider.GetRequiredService<AlbertHeijnScraper>();
+        var jumbo    = scope.ServiceProvider.GetRequiredService<JumboScraper>();
+        var lidl     = scope.ServiceProvider.GetRequiredService<LidlScraper>();
+        var aldi     = scope.ServiceProvider.GetRequiredService<AldiScraper>();
+        var plus     = scope.ServiceProvider.GetRequiredService<PlusScraper>();
+        var dirk     = scope.ServiceProvider.GetRequiredService<DirkScraper>();
+        var colruyt  = scope.ServiceProvider.GetRequiredService<ColruytScraper>();
+        var delhaize = scope.ServiceProvider.GetRequiredService<DelhaizeScraper>();
+        var rewe     = scope.ServiceProvider.GetRequiredService<ReweScraper>();
+        var edeka    = scope.ServiceProvider.GetRequiredService<EdekaScraper>();
 
         await Task.WhenAll(
+            // NL
             CheckAsync("AlbertHeijn", () => ah.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 })),
             CheckAsync("Jumbo",       () => jumbo.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 })),
             CheckAsync("Lidl NL",     () => lidl.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "NL")),
-            CheckAsync("Lidl DE",     () => lidl.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE")),
             CheckAsync("Aldi NL",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "NL")),
-            CheckAsync("Aldi DE",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE")),
             CheckAsync("Plus NL",     () => plus.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 })),
-            CheckAsync("Dirk NL",     () => dirk.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 }))
+            CheckAsync("Dirk NL",     () => dirk.SearchProductAsync(new() { Name = "Coca-Cola", Quantity = 1 })),
+            // BE
+            CheckAsync("Colruyt BE",  () => colruyt.SearchProductAsync(new() { Name = "Cola", Quantity = 1 })),
+            CheckAsync("Delhaize BE", () => delhaize.SearchProductAsync(new() { Name = "Cola", Quantity = 1 })),
+            CheckAsync("Lidl BE",     () => lidl.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "BE")),
+            CheckAsync("Aldi BE",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "BE")),
+            // DE
+            CheckAsync("Rewe DE",     () => rewe.SearchProductAsync(new() { Name = "Cola", Quantity = 1 })),
+            CheckAsync("Edeka DE",    () => edeka.SearchProductAsync(new() { Name = "Cola", Quantity = 1 })),
+            CheckAsync("Lidl DE",     () => lidl.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE")),
+            CheckAsync("Aldi DE",     () => aldi.SearchProductAsync(new() { Name = "Cola", Quantity = 1 }, "DE"))
         );
 
         var live  = _results.Values.Count(r => r.IsLive);
