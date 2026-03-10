@@ -46,7 +46,7 @@ public class AlbertHeijnScraper
     private async Task<List<ProductMatch>> TryWebGql(GroceryItem item)
     {
         // Normaliseer zoekterm (afkortingen, accenten, synoniemen)
-        item = item with { Name = ProductMatcher.NormalizeQueryForSearch(item.Name) };
+        item = new GroceryItem { Name = ProductMatcher.NormalizeQueryForSearch(item.Name), Quantity = item.Quantity, Unit = item.Unit, Category = item.Category, Id = item.Id };
         try
         {
             var payload = new

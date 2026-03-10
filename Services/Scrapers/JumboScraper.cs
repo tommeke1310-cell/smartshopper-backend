@@ -27,7 +27,7 @@ public class JumboScraper
     public async Task<List<ProductMatch>> SearchProductAsync(GroceryItem item)
     {
         // Normaliseer zoekterm
-        item = item with { Name = ProductMatcher.NormalizeQueryForSearch(item.Name) };
+        item = new GroceryItem { Name = ProductMatcher.NormalizeQueryForSearch(item.Name), Quantity = item.Quantity, Unit = item.Unit, Category = item.Category, Id = item.Id };
         // Stap 1: webshop JSON API
         var results = await TryWebshopApi(item);
         if (results.Count > 0) return results;
