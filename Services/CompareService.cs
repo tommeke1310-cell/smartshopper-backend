@@ -25,14 +25,31 @@ public class CompareService
     // Fallback winkels als Google Maps niet beschikbaar is (gesorteerd op relevantie NL)
     private static readonly List<StoreTemplate> FallbackStores =
     [
+        // NL winkels (20 stuks)
         new() { Chain = "Albert Heijn", Country = "NL", City = "Jouw buurt",   DistanceKm = 1.2,  DriveTimeMinutes = 3  },
         new() { Chain = "Jumbo",        Country = "NL", City = "Jouw buurt",   DistanceKm = 1.8,  DriveTimeMinutes = 4  },
         new() { Chain = "Lidl",         Country = "NL", City = "Jouw buurt",   DistanceKm = 2.1,  DriveTimeMinutes = 5  },
         new() { Chain = "Aldi",         Country = "NL", City = "Jouw buurt",   DistanceKm = 2.4,  DriveTimeMinutes = 6  },
-        new() { Chain = "Colruyt",      Country = "BE", City = "Grensregio",   DistanceKm = 18.0, DriveTimeMinutes = 22 },
-        new() { Chain = "Lidl",         Country = "BE", City = "Grensregio",   DistanceKm = 19.0, DriveTimeMinutes = 23 },
-        new() { Chain = "Lidl",         Country = "DE", City = "Grensregio",   DistanceKm = 22.0, DriveTimeMinutes = 26 },
-        new() { Chain = "Rewe",         Country = "DE", City = "Grensregio",   DistanceKm = 24.0, DriveTimeMinutes = 28 },
+        new() { Chain = "Plus",         Country = "NL", City = "Jouw buurt",   DistanceKm = 2.8,  DriveTimeMinutes = 7  },
+        new() { Chain = "Dirk",         Country = "NL", City = "Jouw buurt",   DistanceKm = 3.5,  DriveTimeMinutes = 8  },
+        new() { Chain = "Albert Heijn", Country = "NL", City = "Naburige stad",DistanceKm = 5.0,  DriveTimeMinutes = 10 },
+        new() { Chain = "Jumbo",        Country = "NL", City = "Naburige stad",DistanceKm = 5.5,  DriveTimeMinutes = 11 },
+        new() { Chain = "Lidl",         Country = "NL", City = "Naburige stad",DistanceKm = 6.0,  DriveTimeMinutes = 12 },
+        new() { Chain = "Aldi",         Country = "NL", City = "Naburige stad",DistanceKm = 6.5,  DriveTimeMinutes = 13 },
+        // BE winkels (10 stuks)
+        new() { Chain = "Colruyt",      Country = "BE", City = "Grensregio BE",DistanceKm = 18.0, DriveTimeMinutes = 22 },
+        new() { Chain = "Lidl",         Country = "BE", City = "Grensregio BE",DistanceKm = 19.0, DriveTimeMinutes = 23 },
+        new() { Chain = "Aldi",         Country = "BE", City = "Grensregio BE",DistanceKm = 19.5, DriveTimeMinutes = 24 },
+        new() { Chain = "Delhaize",     Country = "BE", City = "Grensregio BE",DistanceKm = 20.0, DriveTimeMinutes = 25 },
+        new() { Chain = "Carrefour",    Country = "BE", City = "Grensregio BE",DistanceKm = 21.0, DriveTimeMinutes = 26 },
+        new() { Chain = "Albert Heijn", Country = "BE", City = "Grensregio BE",DistanceKm = 22.0, DriveTimeMinutes = 27 },
+        // DE winkels (10 stuks)
+        new() { Chain = "Lidl",         Country = "DE", City = "Grensregio DE",DistanceKm = 22.0, DriveTimeMinutes = 26 },
+        new() { Chain = "Rewe",         Country = "DE", City = "Grensregio DE",DistanceKm = 24.0, DriveTimeMinutes = 28 },
+        new() { Chain = "Aldi",         Country = "DE", City = "Grensregio DE",DistanceKm = 25.0, DriveTimeMinutes = 29 },
+        new() { Chain = "Edeka",        Country = "DE", City = "Grensregio DE",DistanceKm = 26.0, DriveTimeMinutes = 30 },
+        new() { Chain = "Kaufland",     Country = "DE", City = "Grensregio DE",DistanceKm = 27.0, DriveTimeMinutes = 32 },
+        new() { Chain = "Penny",        Country = "DE", City = "Grensregio DE",DistanceKm = 28.0, DriveTimeMinutes = 33 },
     ];
 
     public CompareService(

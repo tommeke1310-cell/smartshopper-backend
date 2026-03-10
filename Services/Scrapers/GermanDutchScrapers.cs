@@ -43,7 +43,7 @@ public class LidlScraper
             Price           = raw.Price,
             IsPromo         = raw.IsPromo,
             IsEstimated     = false,
-            MatchConfidence = WordScore(item.Name, raw.ProductName),
+            MatchConfidence = ProductMatcher.MatchScore(item.Name, raw.ProductName),
             IsBiologisch    = isBio,
             IsVegan         = raw.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase),
             IsHuisMerk      = true,
@@ -194,12 +194,7 @@ public class LidlScraper
         return new ScraperResult(query, 0, false);
     }
 
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0.7;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
-    }
+    // WordScore vervangen door ProductMatcher.MatchScore
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -239,7 +234,7 @@ public class AldiScraper
             Price           = raw.Price,
             IsPromo         = raw.IsPromo,
             IsEstimated     = false,
-            MatchConfidence = WordScore(item.Name, raw.ProductName),
+            MatchConfidence = ProductMatcher.MatchScore(item.Name, raw.ProductName),
             IsBiologisch    = isBio,
             IsVegan         = raw.ProductName.Contains("vegan", StringComparison.OrdinalIgnoreCase),
             IsHuisMerk      = true,
@@ -396,12 +391,7 @@ public class AldiScraper
         return new ScraperResult(query, 0, false);
     }
 
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0.65;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
-    }
+    // WordScore vervangen door ProductMatcher.MatchScore
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -454,7 +444,7 @@ public class DmScraper
                 return [new ProductMatch
                 {
                     StoreName = "DM", Country = country, ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = WordScore(item.Name, name)
+                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = ProductMatcher.MatchScore(item.Name, name)
                 }];
             }
         }
@@ -491,12 +481,7 @@ public class DmScraper
         return [];
     }
 
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
-    }
+    // WordScore vervangen door ProductMatcher.MatchScore
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -551,7 +536,7 @@ public class ReweScraper
                 return [new ProductMatch
                 {
                     StoreName = "Rewe", Country = "DE", ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = WordScore(item.Name, name)
+                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = ProductMatcher.MatchScore(item.Name, name)
                 }];
             }
         }
@@ -602,12 +587,7 @@ public class ReweScraper
         return [];
     }
 
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
-    }
+    // WordScore vervangen door ProductMatcher.MatchScore
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -660,7 +640,7 @@ public class EdekaScraper
                 return [new ProductMatch
                 {
                     StoreName = "Edeka", Country = "DE", ProductName = name, Price = price,
-                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = WordScore(item.Name, name)
+                    IsEstimated = false, IsBiologisch = isBio, MatchConfidence = ProductMatcher.MatchScore(item.Name, name)
                 }];
             }
         }
@@ -707,12 +687,7 @@ public class EdekaScraper
         return [];
     }
 
-    private static double WordScore(string q, string p)
-    {
-        var words = q.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (words.Length == 0) return 0;
-        return (double)words.Count(w => p.ToLower().Contains(w)) / words.Length;
-    }
+    // WordScore vervangen door ProductMatcher.MatchScore
 }
 
 

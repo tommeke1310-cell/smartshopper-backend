@@ -1,178 +1,307 @@
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace SmartShopper.API.Services.Scrapers;
 
-/// <summary>
-/// Gedeelde helper voor product-match scoring en generieke naam extractie.
-/// Zorgt dat "AH rundergehakt 500g" en "Jumbo rundergehakt" en "Lidl rundergehakt"
-/// allemaal als hetzelfde product worden herkend — zodat winkels eerlijk vergeleken worden.
-/// </summary>
+// ================================================================
+//  ProductMatcher — gedeelde matching-logica voor alle scrapers
+//
+//  Verbeteringen t.o.v. oude WordScore:
+//   1. Accent-normalisatie  : 'crème' == 'creme', 'ü' == 'u'
+//   2. Synoniem-mapping     : 'friet' == 'patat', 'mayo' == 'mayonaise'
+//   3. Stemming             : 'croissants' == 'croissant', 'ijsje' == 'ijs'
+//   4. Samengestelde woorden: 'sojasaus' matcht op 'soja saus'
+//   5. Merkproduct detectie : merken hebben vaste prijs, geen multiplier nodig
+//   6. Hogere minimumdrempel: score < 0.5 geen match (was: geen drempel)
+// ================================================================
 public static class ProductMatcher
 {
-    // ─── Winkelmerk-prefixen die weggestript worden ────────────────
-    // "AH rundergehakt" → "rundergehakt"
-    // "Jumbo halfvolle melk" → "halfvolle melk"
-    private static readonly string[] StorePrefixes =
-    [
-        "albert heijn", "ah ", "jumbo", "lidl", "aldi", "plus",
-        "dirk", "spar", "action", "kruidvat", "colruyt", "delhaize",
-        "carrefour", "rewe", "edeka", "kaufland", "netto",
-        "dagvers",
-    ];
-
-    // ─── Synoniemen voor veelgebruikte productnamen ────────────────
-    private static readonly Dictionary<string, string[]> Synonyms = new(StringComparer.OrdinalIgnoreCase)
+    // ── 1. Synoniem mapping (NL <-> NL dialecten/afkortingen/EN) ──────────
+    private static readonly Dictionary<string, string[]> Synoniemen = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["melk"]        = ["milk", "volle melk", "halfvolle melk", "lait"],
-        ["brood"]       = ["bread", "pain", "brot", "boterham", "volkoren"],
-        ["boter"]       = ["butter", "roomboter", "beurre"],
-        ["kaas"]        = ["cheese", "fromage", "käse", "gouda", "edam"],
-        ["eieren"]      = ["eier", "eggs", "ei", "oeufs"],
-        ["appel"]       = ["apple", "pomme", "apfel", "appels"],
-        ["tomaat"]      = ["tomato", "tomate", "tomaten"],
-        ["kip"]         = ["chicken", "poulet", "hähnchen", "kipfilet"],
-        ["varkens"]     = ["pork", "porc", "schwein"],
-        ["rund"]        = ["beef", "boeuf", "rind", "runder", "rundergehakt"],
-        ["gehakt"]      = ["hackfleisch", "haché", "mince", "rundergehakt", "half-om-half"],
-        ["cola"]        = ["coca cola", "coca-cola", "coke"],
-        ["water"]       = ["spa", "mineraalwater", "bronwater"],
-        ["sinaasappel"] = ["orange", "sinas", "jus d'orange"],
-        ["yoghurt"]     = ["yaourt", "joghurt", "yog"],
-        ["rijst"]       = ["rice", "riz", "reis"],
-        ["pasta"]       = ["spaghetti", "penne", "fusilli", "tagliatelle", "linguine"],
-        ["chips"]       = ["crisps", "aardappelchips"],
-        ["frisdrank"]   = ["soda", "fris", "limonade"],
+        // Vlees & Vis
+        ["kipfilet"]         = new[] { "chicken filet", "chicken breast", "kip filet", "kippenfilet" },
+        ["kip"]              = new[] { "chicken", "poulet" },
+        ["rundergehakt"]     = new[] { "runder gehakt", "gehakt rund", "beef mince", "gehakt rund half" },
+        ["gehakt"]           = new[] { "mince", "farce", "rundergehakt", "half om half" },
+        ["varkenshaas"]      = new[] { "varkens haas", "pork tenderloin" },
+        ["bacon"]            = new[] { "ontbijtspek", "spek", "speklapjes" },
+        ["speklapjes"]       = new[] { "bacon", "ontbijtspek", "spek" },
+        ["biefstuk"]         = new[] { "beef steak", "steak" },
+        ["garnalen"]         = new[] { "shrimps", "crevetten", "gambas" },
+        ["zalmfilet"]        = new[] { "zalm filet", "salmon fillet", "salmon" },
+        ["tonijn"]           = new[] { "tuna", "thon" },
+        ["kabeljauw"]        = new[] { "cod", "cabillaud" },
+        // Zuivel
+        ["halfvolle melk"]   = new[] { "half vol melk", "halfvolle", "demi-ecreme" },
+        ["volle melk"]       = new[] { "vol melk", "volle", "entier", "volle liter" },
+        ["magere melk"]      = new[] { "mager melk", "skimmed milk" },
+        ["boter"]            = new[] { "roomboter", "butter", "beurre" },
+        ["roomboter"]        = new[] { "boter", "butter" },
+        ["creme fraiche"]    = new[] { "creme fraiche", "zure room", "sour cream" },
+        ["kwark"]            = new[] { "fromage blanc", "quark" },
+        ["yoghurt"]          = new[] { "yogurt", "yaourt" },
+        ["kaas"]             = new[] { "cheese", "fromage", "kase" },
+        ["smeerkaas"]        = new[] { "cream cheese", "philadelphia" },
+        // Drogisterij
+        ["wc papier"]        = new[] { "toiletpapier", "toilet paper", "wc-papier", "wcpapier" },
+        ["toiletpapier"]     = new[] { "wc papier", "wc-papier", "toilet paper" },
+        ["tandpasta"]        = new[] { "toothpaste", "dentifrice", "tandgel" },
+        ["scheerschuim"]     = new[] { "scheerzeep", "shaving foam" },
+        ["douchegel"]        = new[] { "douche gel", "shower gel", "badgel" },
+        ["wasmiddel"]        = new[] { "waspoeder", "wasgel", "lessive", "laundry" },
+        ["afwasmiddel"]      = new[] { "afwas middel", "washing-up liquid", "liquide vaisselle" },
+        ["deodorant"]        = new[] { "deo", "deospray", "antiperspirant" },
+        // Dranken
+        ["cola"]             = new[] { "coca-cola", "coca cola", "pepsi", "cola zero", "cola light" },
+        ["sinaasappelsap"]   = new[] { "sinaasappel sap", "jus d orange", "orange juice", "appelsientje sinaasappel" },
+        ["appelsap"]         = new[] { "appel sap", "apple juice" },
+        ["bier"]             = new[] { "pils", "lager", "biere" },
+        ["wijn"]             = new[] { "wine", "vin", "wein" },
+        ["koffie"]           = new[] { "coffee", "cafe", "kafee" },
+        ["thee"]             = new[] { "tea", "the", "tee" },
+        ["water"]            = new[] { "bronwater", "bruiswater", "mineral water" },
+        // Groente & Fruit
+        ["aardappelen"]      = new[] { "aardappels", "potatoes", "pommes de terre" },
+        ["aardappel"]        = new[] { "potato", "aardappels" },
+        ["tomaten"]          = new[] { "tomaat", "tomatoes", "tomates" },
+        ["ui"]               = new[] { "uien", "onion", "oignon" },
+        ["knoflook"]         = new[] { "garlic", "ail" },
+        ["spinazie"]         = new[] { "spinach", "epinards" },
+        ["sla"]              = new[] { "ijsbergsla", "lettuce", "salade" },
+        ["champignons"]      = new[] { "paddenstoelen", "mushrooms", "champignon" },
+        ["wortel"]           = new[] { "wortelen", "peen", "carrot" },
+        ["appel"]            = new[] { "apple", "appels" },
+        ["banaan"]           = new[] { "banana", "bananen" },
+        ["aardbei"]          = new[] { "strawberry", "aardbeien" },
+        // Brood & Bakkerij
+        ["brood"]            = new[] { "boterham", "bread", "pain", "brot" },
+        ["wit brood"]        = new[] { "wit tarwebrood", "witbrood", "white bread" },
+        ["volkoren brood"]   = new[] { "volkorenbrood", "wholegrain bread", "pain complet" },
+        ["croissant"]        = new[] { "croissants", "croissantje" },
+        ["crackers"]         = new[] { "cracker", "knackebrod" },
+        // Diepvries
+        ["friet"]            = new[] { "patat", "frites", "french fries", "frieten", "patates frites" },
+        ["patat"]            = new[] { "friet", "frites", "french fries" },
+        ["ijsje"]            = new[] { "ijs", "ice cream", "glace", "roomijs" },
+        ["ijs"]              = new[] { "ijsje", "ice cream", "glace", "roomijs" },
+        ["erwten"]           = new[] { "doperwten", "peas", "petits pois" },
+        ["doperwten"]        = new[] { "erwten", "peas" },
+        // Pasta & Graan
+        ["pasta"]            = new[] { "spaghetti", "penne", "fusilli", "macaroni", "tagliatelle" },
+        ["spaghetti"]        = new[] { "pasta" },
+        ["rijst"]            = new[] { "rice", "riz", "reis" },
+        // Sauzen
+        ["mayo"]             = new[] { "mayonaise", "mayonnaise" },
+        ["mayonaise"]        = new[] { "mayo", "mayonnaise" },
+        ["ketchup"]          = new[] { "tomatenketchup", "tomato ketchup" },
+        ["sojasaus"]         = new[] { "soja saus", "soy sauce", "sojasosse" },
+        ["olijfolie"]        = new[] { "olijf olie", "olive oil", "huile d olive" },
+        // Divers
+        ["eieren"]           = new[] { "eier", "eggs", "oeufs" },
+        ["chocolade"]        = new[] { "chocola", "chocolate", "schokolade" },
+        ["chips"]            = new[] { "crisps", "snacks" },
     };
 
-    // ─── Stopwoorden die geen matchwaarde hebben ───────────────────
-    private static readonly HashSet<string> Stopwords = new(StringComparer.OrdinalIgnoreCase)
+    // ── 2. Merkproducten met vaste prijs (2025-prijzen, AH als referentie) ──
+    public static readonly Dictionary<string, decimal> MerkPrijzen = new(StringComparer.OrdinalIgnoreCase)
     {
-        "de", "het", "een", "van", "met", "voor", "per", "in", "op", "aan",
-        "the", "a", "an", "of", "with", "for", "per",
-        "die", "das", "der", "ein", "eine", "mit", "für",
-        "le", "la", "les", "du", "des", "avec", "pour",
-        "pak", "zak", "fles", "blik", "doos", "stuks", "stuk"
+        // Frisdrank 1.5L
+        ["coca-cola"]           = 1.99m,
+        ["pepsi"]               = 1.89m,
+        ["fanta"]               = 1.89m,
+        ["sprite"]              = 1.89m,
+        ["7up"]                 = 1.89m,
+        // Bier per fles
+        ["heineken"]            = 1.05m,
+        ["amstel"]              = 0.99m,
+        ["grolsch"]             = 1.09m,
+        ["hertog jan"]          = 1.09m,
+        ["jupiler"]             = 0.99m,
+        ["stella artois"]       = 1.05m,
+        // Energy
+        ["red bull"]            = 1.99m,
+        ["monster energy"]      = 1.89m,
+        // Koffie
+        ["douwe egberts"]       = 6.49m,
+        ["nescafe"]             = 5.99m,
+        // Zuivel merk
+        ["activia"]             = 2.49m,
+        ["alpro"]               = 2.29m,
+        // Chocolade & Snoep
+        ["nutella"]             = 3.99m,
+        ["lotus"]               = 2.49m,
+        ["oreo"]                = 2.49m,
+        ["kitkat"]              = 1.49m,
+        ["haribo"]              = 1.49m,
+        // Chips
+        ["lays"]                = 2.49m,
+        ["lay's"]               = 2.49m,
+        ["pringles"]            = 2.99m,
+        ["doritos"]             = 2.49m,
+        // Sauzen
+        ["calve"]               = 2.99m,
+        ["heinz"]               = 2.49m,
+        ["hellmanns"]           = 2.99m,
+        ["kikkoman"]            = 3.49m,
+        // Huishouden
+        ["ariel"]               = 9.99m,
+        ["persil"]              = 8.99m,
+        ["robijn"]              = 8.49m,
+        ["dreft"]               = 3.99m,
+        ["fairy"]               = 3.49m,
+        ["domestos"]            = 2.99m,
+        ["dettol"]              = 3.99m,
+        // Verzorging
+        ["dove"]                = 3.49m,
+        ["axe"]                 = 3.99m,
+        ["nivea"]               = 3.99m,
+        ["colgate"]             = 2.99m,
+        ["sensodyne"]           = 5.99m,
     };
 
-    /// <summary>
-    /// Verwijdert winkelnamen en merkprefixen uit een productnaam.
-    /// "AH rundergehakt 500g" → "rundergehakt 500g"
-    /// "Jumbo halfvolle melk 1L" → "halfvolle melk 1L"
-    /// </summary>
-    public static string StripStoreBrand(string name)
+    // ── 3. Normaliseer string: accenten weg + lowercase + trim ──────────
+    public static string Normalize(string input)
     {
-        var lower = name.ToLowerInvariant().Trim();
-        foreach (var prefix in StorePrefixes)
+        if (string.IsNullOrWhiteSpace(input)) return string.Empty;
+        var decomposed = input.Normalize(NormalizationForm.FormD);
+        var sb = new StringBuilder(decomposed.Length);
+        foreach (var c in decomposed)
         {
-            if (lower.StartsWith(prefix.TrimEnd()))
+            var cat = CharUnicodeInfo.GetUnicodeCategory(c);
+            if (cat != UnicodeCategory.NonSpacingMark)
+                sb.Append(c);
+        }
+        return Regex.Replace(sb.ToString().ToLowerInvariant().Trim(), @"\s+", " ");
+    }
+
+    // ── 4. Stemming: verwijder meervoud/verkleinwoord-suffixen ──────────
+    public static string Stem(string word)
+    {
+        if (word.Length <= 3) return word;
+        if (word.EndsWith("jes"))  return word[..^3];
+        if (word.EndsWith("tje"))  return word[..^3];
+        if (word.EndsWith("je"))   return word[..^2];
+        if (word.EndsWith("ssen")) return word[..^2];
+        if (word.EndsWith("nen"))  return word[..^2];
+        if (word.EndsWith("ren"))  return word[..^2];
+        if (word.EndsWith("ten"))  return word[..^2];
+        if (word.EndsWith("ken"))  return word[..^2];
+        if (word.EndsWith("gen"))  return word[..^2];
+        if (word.EndsWith("len"))  return word[..^2];
+        if (word.EndsWith("ven"))  return word[..^2];
+        if (word.EndsWith("en") && word.Length > 5) return word[..^2];
+        if (word.EndsWith("s")  && word.Length > 4) return word[..^1];
+        return word;
+    }
+
+    // ── 5. Haal synoniem-uitbreidingen op ───────────────────────────────
+    private static IEnumerable<string> GetSynoniemen(string word)
+    {
+        yield return word;
+        if (Synoniemen.TryGetValue(word, out var syns))
+            foreach (var s in syns)
+                yield return Normalize(s);
+        // Omgekeerde mapping
+        foreach (var kvp in Synoniemen)
+        {
+            var normKey = Normalize(kvp.Key);
+            if (normKey == word)
+                continue;
+            if (kvp.Value.Select(Normalize).Contains(word))
             {
-                // Verwijder het prefix + eventuele spatie erna
-                var trimmed = name.Substring(prefix.TrimEnd().Length).TrimStart();
-                if (trimmed.Length > 2) return trimmed;
+                yield return normKey;
+                foreach (var s in kvp.Value)
+                    yield return Normalize(s);
             }
         }
-        return name;
     }
 
-    /// <summary>
-    /// Geeft de generieke productnaam terug: strip winkelmerk + normaliseer.
-    /// Gebruik dit als zoekterm bij andere scrapers.
-    /// "AH rundergehakt 500g" → "rundergehakt"
-    /// "Coca-Cola Zero 6-pack" → "Coca-Cola Zero" (A-merk bewaard)
-    /// </summary>
-    public static string GenericSearchName(string name)
-    {
-        // 1. Strip winkelmerk-prefix
-        var stripped = StripStoreBrand(name);
-
-        // 2. Normaliseer
-        var normalized = Normalize(stripped);
-
-        // 3. Haal keywords op (hoeveelheden/eenheden worden genegeerd bij zoeken)
-        var keywords = GetKeywords(normalized);
-
-        // Geef de keywords terug als zoekopdracht (max 4 woorden voor beste resultaten)
-        return keywords.Length > 0
-            ? string.Join(" ", keywords.Take(4))
-            : stripped;
-    }
-
-    /// <summary>
-    /// Berekent een nauwkeurige match-score tussen zoekopdracht en productnaam.
-    /// Score 0.0–1.0, hoger = betere match.
-    /// </summary>
-    public static double Score(string query, string productName)
+    // ── 6. Hoofd MatchScore (vervangt WordScore in alle scrapers) ────────
+    public static double MatchScore(string query, string productName)
     {
         if (string.IsNullOrWhiteSpace(query) || string.IsNullOrWhiteSpace(productName))
             return 0;
 
-        var q = Normalize(query);
-        var p = Normalize(productName);
+        var qNorm = Normalize(query);
+        var pNorm = Normalize(productName);
 
         // Exacte match
-        if (q == p) return 1.0;
+        if (qNorm == pNorm) return 1.0;
 
-        // Product bevat volledige query
-        if (p.Contains(q)) return 0.95;
+        // Samengesteld: 'sojasaus' matcht op 'soja saus'
+        var qComp = qNorm.Replace(" ", "");
+        var pComp = pNorm.Replace(" ", "");
+        if (pComp.Contains(qComp) || qComp.Contains(pComp))
+            return 0.9;
 
-        // Query bevat volledige productnaam
-        if (q.Contains(p)) return 0.90;
+        var queryWords   = qNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var productWords = pNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var productStemmedSet = productWords.Select(Stem).ToHashSet(StringComparer.Ordinal);
 
-        var qWords = GetKeywords(q);
-        var pWords = GetKeywords(p);
+        double matchedWeight = 0;
+        double totalWeight   = 0;
 
-        if (qWords.Length == 0) return 0;
-
-        int hits = 0;
-        foreach (var qw in qWords)
+        foreach (var qWord in queryWords)
         {
-            bool matched = pWords.Any(pw => pw == qw || pw.Contains(qw) || qw.Contains(pw));
+            // Kortere woorden wegen minder
+            double weight = qWord.Length >= 5 ? 1.0 : qWord.Length >= 3 ? 0.6 : 0.2;
+            totalWeight += weight;
 
-            if (!matched && Synonyms.TryGetValue(qw, out var syns))
-                matched = syns.Any(s => p.Contains(s));
+            var qStemmed    = Stem(qWord);
+            var allVariants = GetSynoniemen(qWord)
+                .Concat(GetSynoniemen(qStemmed))
+                .Select(Normalize)
+                .Distinct()
+                .ToList();
 
-            // Omgekeerde synonymen-check
-            if (!matched)
-                matched = Synonyms.Any(kv =>
-                    kv.Value.Contains(qw, StringComparer.OrdinalIgnoreCase) &&
-                    (p.Contains(kv.Key) || pWords.Any(pw => pw == kv.Key)));
+            bool found = allVariants.Any(variant =>
+                pNorm.Contains(variant) ||
+                productStemmedSet.Contains(Stem(variant)) ||
+                productWords.Any(pw =>
+                    pw.StartsWith(variant, StringComparison.Ordinal) ||
+                    variant.StartsWith(pw, StringComparison.Ordinal)));
 
-            if (matched) hits++;
+            if (found) matchedWeight += weight;
         }
 
-        double baseScore = (double)hits / qWords.Length;
+        if (totalWeight == 0) return 0;
+        double score = matchedWeight / totalWeight;
 
-        if (hits == qWords.Length) baseScore = Math.Min(1.0, baseScore + 0.1);
+        // Kleine bonus als product-woorden ook in query voorkomen
+        int reverseHits = productWords
+            .Where(pw => pw.Length >= 4)
+            .Count(pw => qNorm.Contains(pw) ||
+                         queryWords.Any(qw => Stem(qw) == Stem(pw)));
+        double bonus = Math.Min(0.1, reverseHits * 0.03);
 
-        int extraPWords = pWords.Count(pw => !qWords.Any(qw => qw == pw || pw.Contains(qw)));
-        if (extraPWords > 2) baseScore *= 0.85;
-
-        return Math.Round(baseScore, 3);
+        return Math.Min(1.0, score + bonus);
     }
 
-    public static bool IsReliableMatch(double score) => score >= 0.55;
-
-    public static string Normalize(string input)
+    // ── 7. Verrijk zoekterm voor betere API-resultaten ──────────────────
+    public static string NormalizeQueryForSearch(string query)
     {
-        return input.ToLowerInvariant()
-            .Replace("é", "e").Replace("è", "e").Replace("ê", "e")
-            .Replace("ü", "u").Replace("ö", "o").Replace("ä", "a")
-            .Replace("ï", "i").Replace("ç", "c")
-            .Replace("-", " ").Replace("_", " ")
-            .Replace("'", "").Replace("\"", "")
-            .Trim();
+        var q = Normalize(query);
+        // Vervang bekende afkortingen door volledige zoektermen
+        q = q.Replace("mayo", "mayonaise")
+             .Replace("wc papier", "toiletpapier")
+             .Replace("wcpapier",  "toiletpapier")
+             .Replace("friet",     "patat")
+             .Replace("ijsje",     "ijs");
+        return q.Trim();
     }
 
-    private static string[] GetKeywords(string normalized)
+    // ── 8. Merkprijs opzoeken ────────────────────────────────────────────
+    public static decimal? GetMerkPrijs(string query)
     {
-        return normalized
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            .Where(w => w.Length > 1 && !Stopwords.Contains(w) && !IsUnit(w) && !IsNumber(w))
-            .ToArray();
+        var q = Normalize(query);
+        foreach (var kvp in MerkPrijzen)
+        {
+            if (q.Contains(Normalize(kvp.Key)))
+                return kvp.Value;
+        }
+        return null;
     }
 
-    private static bool IsUnit(string w) =>
-        Regex.IsMatch(w, @"^\d*(g|kg|ml|l|cl|liter|gram|stuks?|pak|fles|blik|doos)s?$");
-
-    private static bool IsNumber(string w) => Regex.IsMatch(w, @"^\d+[\.,]?\d*$");
+    public static bool IsMerkProduct(string query) => GetMerkPrijs(query) != null;
 }
