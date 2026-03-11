@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using System.Text;
 using System.Globalization;
 using HtmlAgilityPack;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace SmartShopper.API.Services;
 
@@ -19,6 +20,7 @@ public class BackgroundScraperService : BackgroundService
     private readonly ILogger<BackgroundScraperService> _logger;
     private readonly IConfiguration _config;
     private readonly IServiceProvider _services;
+    private readonly IHttpClientFactory _factory;
 
     private static readonly TimeSpan SCRAPE_INTERVAL = TimeSpan.FromHours(6);
     private static readonly TimeSpan REQUEST_DELAY   = TimeSpan.FromMilliseconds(800);
@@ -26,11 +28,13 @@ public class BackgroundScraperService : BackgroundService
     public BackgroundScraperService(
         ILogger<BackgroundScraperService> logger,
         IConfiguration config,
-        IServiceProvider services)
+        IServiceProvider services,
+        IHttpClientFactory factory)
     {
         _logger   = logger;
         _config   = config;
         _services = services;
+        _factory  = factory;
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -142,7 +146,8 @@ public class BackgroundScraperService : BackgroundService
         nlTasks.Add(TryScrapeService("Jumbo", "NL", async () =>
         {
             using var jumboHttp = MakeHttpClient();
-            var scraper = new JumboScraper(jumboHttp, jumboLogger);
+            var jumboCache = _services.GetRequiredService<IMemoryCache>();
+            var scraper = new JumboScraper(jumboHttp, jumboLogger, jumboCache);
             var matches = await scraper.SearchProductAsync(item);
             var best = matches.OrderByDescending(m => m.MatchConfidence).FirstOrDefault();
             return best != null && best.Price > 0 ? (best.Price, best.IsPromo) : ((decimal, bool)?)null;
@@ -169,7 +174,7 @@ public class BackgroundScraperService : BackgroundService
         var dmLogger = _services.GetRequiredService<ILogger<DmScraper>>();
         nlTasks.Add(TryScrapeService("DM", "NL", async () =>
         {
-            var dmHttp  = _factory.CreateClient("scraper");
+            var dmHttp  = MakeHttpClient();
             var scraper = new DmScraper(dmHttp, dmLogger);
             var matches = await scraper.SearchProductAsync(item, "NL");
             var match   = matches.FirstOrDefault();
@@ -177,7 +182,7 @@ public class BackgroundScraperService : BackgroundService
         }));
         nlTasks.Add(TryScrapeService("DM", "DE", async () =>
         {
-            var dmHttp  = _factory.CreateClient("scraper");
+            var dmHttp  = MakeHttpClient();
             var scraper = new DmScraper(dmHttp, dmLogger);
             var matches = await scraper.SearchProductAsync(item, "DE");
             var match   = matches.FirstOrDefault();
